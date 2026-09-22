@@ -8,10 +8,12 @@ on:
       - "carnet_gui.py"
       - "carnet_sheet.py"
       - ".github/workflows/build-windows-exe.yml"
+    tags:
+      - "v*"          # tag pushes create a GitHub Release with the exe
 
 permissions:
   id-token: write   # for OIDC auth with Azure Artifact Signing
-  contents: read
+  contents: write   # needed to create/edit GitHub Releases
 
 jobs:
   build:
@@ -116,9 +118,28 @@ jobs:
             Write-Warning "Signature status is '$status' - inspect before distributing."
           }
 
-      - name: Upload artifact
+      - name: Name the exe after the version
+        # e.g. CarnetSheetMaker-v1.2.0.exe (falls back to run number)
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ($version -notmatch '^v\d') { $version = "v1.0.${{ github.run_number }}" }
+          Copy-Item "dist/CarnetSheetMaker.exe" "dist/CarnetSheetMaker-$version.exe"
+          Write-Host "Released file: dist/CarnetSheetMaker-$version.exe"
+
+      - name: Upload artifact (per-run archive copy)
         uses: actions/upload-artifact@v4
         with:
-          name: CarnetSheetMaker-windows
-          path: dist/CarnetSheetMaker.exe
+          name: CarnetSheetMaker-windows-${{ github.run_number }}
+          path: dist/CarnetSheetMaker-*.exe
           if-no-files-found: error
+
+      - name: Attach exe to GitHub Release
+        # Creates the Release when triggered by a v* tag push (or a manual
+        # dispatch on a tag ref); skips on ordinary branch builds.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CarnetSheetMaker-*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
