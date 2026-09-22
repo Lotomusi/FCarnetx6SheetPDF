@@ -591,6 +591,13 @@ class CarnetSheetGUI:
         self._generation_lock.release()
         if error is not None:
             self.status.set("Generation failed — see the message.")
+            if os.environ.get("SELFTEST_LOG") or getattr(sys, "frozen", False):
+                # In selftest/frozen runs stdout may be unusable; the selftest
+                # has already redirected it to its log file.
+                import traceback
+
+                traceback.print_exception(type(error), error, error.__traceback__)
+                print(f"GENERATION-ERROR: {error}")
             messagebox.showerror("Could not generate the PDF", str(error))
             return
         assert summary is not None
