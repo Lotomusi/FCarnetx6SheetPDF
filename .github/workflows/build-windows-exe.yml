@@ -3,7 +3,7 @@ name: Build Windows exe
 on:
   workflow_dispatch: {}   # manual run from the Actions tab
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "carnet_gui.py"
       - "carnet_sheet.py"
@@ -98,6 +98,23 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Check signature status
+        # Tells you at a glance whether the artifact actually got signed.
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "dist/CarnetSheetMaker.exe"
+          $status = $sig.Status
+          $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "<none>" }
+          Write-Host "Signature status : $status"
+          Write-Host "Signer           : $signer"
+          if ($status -eq 'Valid') {
+            Write-Host "== SIGNED build ready to distribute."
+          } elseif ($status -eq 'NotSigned') {
+            Write-Host "== UNSIGNED build: set the AZURE_* repo secrets (see docs/CODE_SIGNING.md) to sign automatically."
+          } else {
+            Write-Warning "Signature status is '$status' - inspect before distributing."
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
