@@ -1,0 +1,107 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch: {}   # manual run from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - "carnet_gui.py"
+      - "carnet_sheet.py"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  id-token: write   # for OIDC auth with Azure Artifact Signing
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow reportlab pyinstaller
+
+      - name: Run tests
+        run: python -m unittest discover -p "test_*.py"
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          if ($tag -notmatch '^\d+(\.\d+){0,3}$') { $tag = "1.0.0" }
+          # Stamp the version from the git tag into the version resource.
+          (Get-Content assets/version_info.txt -Raw) `
+            -replace '"FileVersion", "[^"]*"', "`"FileVersion`", `"$tag.0`"" `
+            -replace '"ProductVersion", "[^"]*"', "`"ProductVersion`", `"$tag.0`"" `
+            | Set-Content assets/version_info.txt
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name CarnetSheetMaker `
+            --icon assets/icon.ico `
+            --version-file assets/version_info.txt `
+            --add-data "assets/icon_256.png;assets" `
+            carnet_gui.py
+
+      - name: Smoke-test the exe
+        shell: pwsh
+        run: |
+          # The exe is a GUI app: verify it starts and exits cleanly.
+          $p = Start-Process -FilePath "dist/CarnetSheetMaker.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) { throw "exe exited immediately (exit code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Compress with UPX (optional)
+        # Opt-in via repository variable UPX=1. PyInstaller's archive is
+        # already compressed, so the gain is tiny (~0.8% on this app) and
+        # some antivirus tools flag UPX-packed binaries.
+        if: vars.UPX == '1'
+        shell: pwsh
+        run: |
+          $upx = (Get-ChildItem "$env:RUNNER_TOOL_CACHE" -Recurse -Filter upx.exe |
+                  Select-Object -First 1).FullName
+          if (-not $upx) {
+            $zip = Join-Path $env:RUNNER_TEMP "upx.zip"
+            Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v5.0.2/upx-5.0.2-win64.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP/upx"
+            $upx = (Get-ChildItem "$env:RUNNER_TEMP/upx" -Recurse -Filter upx.exe |
+                    Select-Object -First 1).FullName
+          }
+          & $upx --best --lzma --force "dist/CarnetSheetMaker.exe"
+
+      - name: Sign with Azure Artifact Signing
+        # Runs only when the Azure signing secrets are configured;
+        # otherwise skipped so the build never breaks without them.
+        if: >
+          env.AZURE_CLIENT_ID != '' &&
+          env.AZURE_SIGNING_ACCOUNT != ''
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\CarnetSheetMaker.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarnetSheetMaker-windows
+          path: dist/CarnetSheetMaker.exe
+          if-no-files-found: error

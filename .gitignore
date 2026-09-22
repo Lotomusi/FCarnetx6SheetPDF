@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-build/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+# The built exe is shipped intentionally; do not ignore it.
+!CarnetSheetMaker.exe
+
+# Sample outputs users may generate
+*_sheet.pdf
+
+# OS noise
+Thumbs.db
+.DS_Store
