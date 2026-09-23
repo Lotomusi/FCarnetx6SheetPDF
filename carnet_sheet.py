@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Carnet Photo Sheet Maker.
 
-Takes one finished carnet photograph and produces a print-ready PDF
-containing a configurable arrangement of identical copies of it on a
-single page (by default: six copies in a horizontal strip near the top
-of a US Letter portrait page).
+Takes one or more finished carnet photographs and produces a print-ready PDF
+containing a configurable arrangement of copies of them (by default: six
+copies of a single photo in a horizontal strip near the top of a US Letter
+portrait page).
+
+Multiple photographs can be combined in one job: each source image carries
+its own copy quantity, and the requested placements are laid out as one
+collection (sequential/row-major ordering) onto as many pages as needed.
 
 This tool only performs layout and document generation. It never modifies
 the appearance of the photograph itself: no cropping, stretching, rotating,
@@ -17,7 +21,8 @@ import argparse
 import io
 import math
 import sys
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -54,6 +59,12 @@ class LayoutError(ValueError):
     """Raised when the requested layout cannot be produced as specified."""
 
 
+# True zero-gap layout: adjacent carnet photos touch, so the printed sheet
+# can be cut with a single straight line and no extra trimming.
+DEFAULT_SPACING_X = 0.0
+DEFAULT_SPACING_Y = 0.0
+
+
 @dataclass
 class LayoutConfig:
     """All tunable layout parameters, with defaults matching the reference.
@@ -61,16 +72,21 @@ class LayoutConfig:
     photo_width/photo_height describe the target box for one photograph.
     The image is always drawn at its own aspect ratio, contained inside that
     box, so it is never stretched or squashed.
+
+    Copies are packed with zero intentional spacing between adjacent photos
+    (spacing_x/spacing_y default to 0). They remain configurable (and
+    non-negative) so existing scripts keep working, but the defaults now
+    produce a true 0-gap layout.
     """
 
     paper: str = "letter"  # key of PAPER_SIZES
     orientation: str = "portrait"  # "portrait" | "landscape"
-    copies: int = 6  # total number of photo placements
+    copies: int = 6  # total number of photo placements (single-image mode)
     columns: int = 6  # photos per row
     photo_width: float = 85.79  # points (≈ 1.19 in / 30.3 mm, from reference)
     photo_height: float = 114.14  # points (≈ 1.59 in / 40.3 mm, from reference)
-    spacing_x: float = 6.0  # horizontal gap between photos, points
-    spacing_y: float = 12.0  # vertical gap between rows, points
+    spacing_x: float = DEFAULT_SPACING_X  # gap between adjacent photos (0 = cut-together)
+    spacing_y: float = DEFAULT_SPACING_Y  # gap between rows (0 = cut-together)
     top_margin: float = 30.0  # page top margin, points
     left_margin: float = 30.0  # page left margin, points
     right_margin: float = 30.0  # page right margin, points
@@ -141,6 +157,25 @@ class LayoutResult:
     scaled: bool  # True if fit-to-page reduced the requested size
     content_width: float
     content_height: float
+
+
+@dataclass(frozen=True)
+class Placement:
+    """One concrete photo placement (image + rectangle) on a page."""
+
+    job_index: int  # index into the list of source images for this placement
+    x: float  # left edge, PDF coordinates (origin bottom-left)
+    y: float
+    width: float
+    height: float
+
+
+@dataclass(frozen=True)
+class PageLayout:
+    """Resolved geometry of one page of a (possibly multi-page) sheet."""
+
+    result: LayoutResult
+    placements: tuple[Placement, ...]
 
 
 def _row_col(index: int, columns: int) -> tuple[int, int]:
@@ -247,6 +282,184 @@ def placement_rects(
 
 
 # --------------------------------------------------------------------------- #
+# Multi-image layout planning                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _drawn_size(
+    box_width: float, box_height: float, aspect: float
+) -> tuple[float, float]:
+    """Largest (w, h) with the given aspect that fits the box (containment)."""
+    by_width = (box_width, box_width / aspect)
+    by_height = (box_height * aspect, box_height)
+    if by_width[1] <= box_height + 1e-9:
+        return by_width
+    return by_height
+
+
+def placement_plan(
+    job_aspects: Sequence[Sequence[float]], config: LayoutConfig
+) -> list[PageLayout]:
+    """Plan every page needed for a multi-image job.
+
+    ``job_aspects`` holds the aspects of each source image's requested
+    placements, in sequential order. The packing is sequential/row-major:
+    finish the requested copies of the first image, then continue with the
+    next image, wrapping onto additional pages with the same layout rules
+    when the current page's columns × rows grid is full.
+    """
+    if not job_aspects:
+        raise LayoutError("No photographs were requested.")
+
+    page_w, page_h = config.paper_dimensions()
+    avail_h = page_h - config.top_margin
+    # Rows that physically fit below the top margin (drawn heights never
+    # exceed the configured box height, so this never overfills a page).
+    rows_that_fit = int(avail_h // config.photo_height)
+    if rows_that_fit < 1:
+        if not config.fit_to_page:
+            raise LayoutError(
+                f"One photo of {config.photo_height:.2f} pt "
+                f"({pt_to_mm(config.photo_height):.1f} mm) needs more vertical "
+                f"space than the {avail_h:.2f} pt ({pt_to_mm(avail_h):.1f} mm) "
+                f"available below the top margin on {config.paper} "
+                f"{config.orientation}. Reduce the photo height or top "
+                "margin, or use --fit-to-page."
+            )
+        rows_that_fit = 1  # fit-to-page shrinks the single row below
+    capacity = rows_that_fit * config.columns
+
+    # Planning grid: a page always holds `capacity` slots (validate needs
+    # copies >= columns, which capacity guarantees).
+    grid = replace(config, copies=capacity)
+    grid.validate()
+
+    flat: list[float] = []
+    job_indices: list[int] = []
+    for job_index, aspects in enumerate(job_aspects):
+        flat.extend(aspects)
+        job_indices.extend([job_index] * len(aspects))
+    if not flat:
+        raise LayoutError("No photographs were requested.")
+
+    pages: list[PageLayout] = []
+    start = 0
+    while start < len(flat):
+        chunk = flat[start : start + capacity]
+        chunk_jobs = job_indices[start : start + capacity]
+        result, placements = _plan_page(chunk, page_w, page_h, grid, chunk_jobs)
+        pages.append(PageLayout(result=result, placements=tuple(placements)))
+        start += len(chunk)
+    return pages
+
+
+def _plan_page(
+    aspects: Sequence[float],
+    page_w: float,
+    page_h: float,
+    config: LayoutConfig,
+    job_indices: Sequence[int] | None = None,
+) -> tuple[LayoutResult, list[Placement]]:
+    """Lay out one page of photo aspects, row-major, with zero gaps.
+
+    Every photo keeps its own aspect ratio inside the configured photo box;
+    each row's height is driven by the tallest drawn photo in that row and
+    the page width by the widest row. Raises LayoutError if the page does
+    not fit and fit-to-page is disabled (same rules as compute_layout).
+
+    ``job_indices`` maps each aspect back to its source image; it defaults
+    to the identity when a caller only cares about geometry.
+    """
+    if not aspects:
+        raise LayoutError("No photographs were requested.")
+    if job_indices is None:
+        job_indices = range(len(aspects))
+    drawn = [_drawn_size(config.photo_width, config.photo_height, a) for a in aspects]
+    rows_count = math.ceil(len(drawn) / config.columns)
+
+    scale = 1.0
+
+    def measure() -> tuple[float, float, list[float], list[float]]:
+        row_widths: list[float] = []
+        row_heights: list[float] = []
+        for r in range(rows_count):
+            row_items = drawn[r * config.columns : (r + 1) * config.columns]
+            row_widths.append(sum(w for w, _h in row_items))
+            row_heights.append(max(h for _w, h in row_items))
+        # Rows stack vertically, but each row is centred independently, so
+        # the content width is the widest row (not the sum of all rows).
+        return max(row_widths), sum(row_heights), row_heights, row_widths
+
+    cw, ch, row_heights, _row_widths = measure()
+    avail_w = page_w - config.left_margin - config.right_margin
+    avail_h = page_h - config.top_margin
+
+    if cw > avail_w + 1e-6 or ch > avail_h + 1e-6:
+        if not config.fit_to_page:
+            if cw > avail_w + 1e-6:
+                raise LayoutError(
+                    f"The {config.columns}-column layout needs {cw:.2f} pt "
+                    f"({pt_to_mm(cw):.1f} mm) of horizontal space, but only "
+                    f"{avail_w:.2f} pt ({pt_to_mm(avail_w):.1f} mm) is available "
+                    f"between the margins on {config.paper} {config.orientation}. "
+                    "Reduce the photo width/spacing or the column count, or use "
+                    "--fit-to-page."
+                )
+            raise LayoutError(
+                f"The layout needs {ch:.2f} pt ({pt_to_mm(ch):.1f} mm) of "
+                f"vertical space, but only {avail_h:.2f} pt "
+                f"({pt_to_mm(avail_h):.1f} mm) is available below the top margin "
+                f"on {config.paper} {config.orientation}. Reduce the photo "
+                "height/spacing or the number of rows, or use --fit-to-page."
+            )
+        # Fit to page: shrink uniformly, preserving each image's aspect ratio.
+        scale = min(avail_w / cw, avail_h / ch)
+        drawn = [(w * scale, h * scale) for w, h in drawn]
+        cw, ch, row_heights, _row_widths = measure()
+
+    # --- Centering (same rule as compute_layout) ------------------------------
+    free_w = page_w - config.left_margin - config.right_margin - cw
+    x0 = config.left_margin + max(0.0, free_w / 2.0)
+    y_top = page_h - config.top_margin
+
+    # Zero-gap packing: photos sit edge to edge inside each row.
+    placements: list[Placement] = []
+    y_cursor = y_top
+    index = 0
+    for r in range(rows_count):
+        row_count = min(config.columns, len(drawn) - r * config.columns)
+        row_width = sum(w for w, _h in drawn[index : index + row_count])
+        x_cursor = x0 + max(0.0, (cw - row_width) / 2.0)
+        for _c in range(row_count):
+            w, h = drawn[index]
+            placements.append(
+                Placement(
+                    job_index=job_indices[index],
+                    x=x_cursor,
+                    y=y_cursor - h,
+                    width=w,
+                    height=h,
+                )
+            )
+            x_cursor += w
+            index += 1
+        y_cursor -= row_heights[r]
+
+    result = LayoutResult(
+        page_width=page_w,
+        page_height=page_h,
+        photo_width=drawn[0][0],
+        photo_height=drawn[0][1],
+        x0=x0,
+        y_top=y_top,
+        scaled=scale != 1.0,
+        content_width=cw,
+        content_height=ch,
+    )
+    return result, placements
+
+
+# --------------------------------------------------------------------------- #
 # Image handling                                                              #
 # --------------------------------------------------------------------------- #
 
@@ -304,69 +517,123 @@ def load_source_image(path: Path) -> SourceImage:
 
 
 def generate_pdf(
-    image_path: Path,
+    image_path: Path | Sequence[Path],
     output_path: Path,
     config: LayoutConfig,
+    quantities: Sequence[int] | None = None,
 ) -> dict:
-    """Generate the sheet PDF. Returns a summary dict describing the output."""
+    """Generate the sheet PDF. Returns a summary dict describing the output.
+
+    Single-image mode (semantics unchanged): one ``image_path`` and no
+    ``quantities`` produces ``config.copies`` placements — now with the
+    zero-gap defaults, so adjacent photos touch.
+
+    Multi-image mode: pass a list of image paths and a matching
+    ``quantities`` list (same length). The requested placements are packed
+    sequentially (row-major): all copies of the first image, then the next,
+    continuing onto extra pages with the same layout rules when needed.
+    """
     from reportlab.lib.colors import black
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
 
-    image_path = Path(image_path)
+    # --- Normalise arguments -------------------------------------------------
+    if isinstance(image_path, (list, tuple)):
+        paths = [Path(p) for p in image_path]
+    else:
+        paths = [Path(image_path)]
+    if not paths:
+        raise LayoutError("No photographs were requested.")
+    if quantities is not None:
+        quantities = [int(q) for q in quantities]
+        if len(quantities) != len(paths):
+            raise ValueError(
+                "quantities must have one entry per source image "
+                f"({len(paths)} images, {len(quantities)} quantities)."
+            )
+        if any(q < 1 for q in quantities):
+            raise LayoutError("Each source image needs at least 1 copy.")
+
     output_path = Path(output_path)
 
-    src = load_source_image(image_path)
-    layout = compute_layout(config, src.aspect)
-    rects = placement_rects(layout, config)
+    # --- Load sources --------------------------------------------------------
+    sources: list[SourceImage] = [load_source_image(p) for p in paths]
 
-    # Embed the EXIF-oriented pixels. Without EXIF rotation the original
-    # file is passed to ReportLab untouched (no recompression, no quality
-    # loss for JPEG); with an orientation tag the raw pixels would appear
-    # sideways, so a one-time oriented buffer is prepared instead.
-    embed_path = image_path
-    oriented_buffer: io.BytesIO | None = None
-    if src.exif_applied:
-        with Image.open(image_path) as im:
-            im.load()
-            oriented_buffer = io.BytesIO()
-            # Save the transposed pixels losslessly; the original file on
-            # disk is never touched.
-            ImageOps.exif_transpose(im).save(oriented_buffer, format="PNG")
-        oriented_buffer.seek(0)
+    # --- Plan the pages ------------------------------------------------------
+    if quantities is None:
+        # Single-image mode: classic one-page layout, semantics unchanged.
+        layout = compute_layout(config, sources[0].aspect)
+        rects = placement_rects(layout, config)
+        pages: list[PageLayout] = [
+            PageLayout(
+                result=layout,
+                placements=tuple(
+                    Placement(job_index=0, x=x, y=y, width=w, height=h)
+                    for x, y, w, h in rects
+                ),
+            )
+        ]
+    else:
+        job_aspects: list[list[float]] = []
+        for source, quantity in zip(sources, quantities):
+            job_aspects.append([source.aspect] * quantity)
+        pages = placement_plan(job_aspects, config)
 
+    first_page = pages[0].result
+
+    # --- Embed buffers (EXIF-oriented pixels where needed) -------------------
+    embeds: dict[int, io.BytesIO] = {}
+    for index, source in enumerate(sources):
+        if source.exif_applied:
+            with Image.open(paths[index]) as im:
+                im.load()
+                buffer = io.BytesIO()
+                # Save the transposed pixels losslessly; the original file on
+                # disk is never touched.
+                ImageOps.exif_transpose(im).save(buffer, format="PNG")
+                buffer.seek(0)
+            embeds[index] = buffer
+
+    # --- Draw ----------------------------------------------------------------
     c = canvas.Canvas(
         str(output_path),
-        pagesize=(layout.page_width, layout.page_height),
+        pagesize=(first_page.page_width, first_page.page_height),
         pageCompression=1,
         invariant=1,
     )
     c.setTitle("Carnet photo sheet")
     c.setAuthor("carnet_sheet.py")
     try:
-        for x, y, w, h in rects:
-            # White behind the image so transparency flattens cleanly.
-            c.setFillColorRGB(1, 1, 1)
-            c.rect(x, y, w, h, stroke=0, fill=1)
-            if oriented_buffer is not None:
-                oriented_buffer.seek(0)
-                reader = ImageReader(oriented_buffer)
-            else:
-                reader = ImageReader(str(image_path))
-            c.drawImage(
-                reader,
-                x,
-                y,
-                width=w,
-                height=h,
-                preserveAspectRatio=False,  # box already matches image aspect
-                mask=None,
-            )
-            if config.border:
-                c.setStrokeColor(black)
-                c.setLineWidth(config.border_width)
-                c.rect(x, y, w, h, stroke=1, fill=0)
-        c.showPage()
+        for page in pages:
+            for placement in page.placements:
+                # White behind the image so transparency flattens cleanly.
+                c.setFillColorRGB(1, 1, 1)
+                c.rect(
+                    placement.x, placement.y, placement.width, placement.height,
+                    stroke=0, fill=1,
+                )
+                if placement.job_index in embeds:
+                    embeds[placement.job_index].seek(0)
+                    reader = ImageReader(embeds[placement.job_index])
+                else:
+                    reader = ImageReader(str(paths[placement.job_index]))
+                c.drawImage(
+                    reader,
+                    placement.x,
+                    placement.y,
+                    width=placement.width,
+                    height=placement.height,
+                    preserveAspectRatio=False,  # box already matches image aspect
+                    mask=None,
+                )
+                if config.border:
+                    c.setStrokeColor(black)
+                    c.setLineWidth(config.border_width)
+                    c.rect(
+                        placement.x, placement.y, placement.width, placement.height,
+                        stroke=1, fill=0,
+                    )
+            c.showPage()
         c.save()
     except Exception as exc:
         # Never leave a broken file behind claiming success.
@@ -378,15 +645,17 @@ def generate_pdf(
             f"PDF generation failed: {exc.__class__.__name__}: {exc}"
         ) from exc
 
+    total_placements = sum(len(page.placements) for page in pages)
     return {
         "output": output_path,
-        "page_size": (layout.page_width, layout.page_height),
-        "placements": len(rects),
-        "photo_size": (layout.photo_width, layout.photo_height),
-        "scaled": layout.scaled,
-        "content_width": layout.content_width,
-        "x0": layout.x0,
-        "exif_applied": src.exif_applied,
+        "page_size": (first_page.page_width, first_page.page_height),
+        "pages": len(pages),
+        "placements": total_placements,
+        "photo_size": (first_page.photo_width, first_page.photo_height),
+        "scaled": first_page.scaled,
+        "content_width": first_page.content_width,
+        "x0": first_page.x0,
+        "exif_applied": sources[0].exif_applied,
     }
 
 
@@ -399,35 +668,46 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="carnet_sheet",
         description=(
-            "Generate a print-ready PDF with six identical copies of a finished "
-            "carnet photograph on one US Letter portrait page. The photo is "
-            "never modified; only the layout is produced."
+            "Generate a print-ready PDF with copies of finished carnet "
+            "photographs (by default six copies of one photo in a strip near "
+            "the top of a US Letter portrait page). The photos are never "
+            "modified; only the layout is produced. Adjacent photos have "
+            "zero spacing so the sheet can be cut in straight lines."
         ),
         epilog=(
-            "Example: python carnet_sheet.py foto.jpg  →  foto_sheet.pdf "
-            "with six 1.19 × 1.59 in copies in a centered strip near the top. "
+            "Examples:\n"
+            "  python carnet_sheet.py foto.jpg  →  foto_sheet.pdf with six "
+            "1.19 × 1.59 in copies near the top.\n"
+            "  python carnet_sheet.py a.jpg b.jpg c.jpg --copies 6,6,3  →  "
+            "one combined sheet with 15 photos (extra pages if needed).\n"
             "Sizes can be given in millimetres with --mm."
         ),
     )
-    p.add_argument("image", type=Path,
-                   help="finished carnet photograph (JPEG, PNG, WebP)")
+    p.add_argument("image", nargs="+", type=Path,
+                   help="finished carnet photograph(s) (JPEG, PNG, WebP); "
+                        "several can be combined on the same sheet(s)")
     p.add_argument("-o", "--output", type=Path,
-                   help="output PDF path (default: <image>_sheet.pdf next to the photo)")
+                   help="output PDF path (default: <first-image>_sheet.pdf "
+                        "next to the first photo)")
     p.add_argument("--paper", choices=sorted(PAPER_SIZES), default="letter",
                    help="paper size (default: letter)")
     p.add_argument("--orientation", choices=["portrait", "landscape"],
                    default="portrait", help="page orientation (default: portrait)")
-    p.add_argument("--copies", type=int, default=6, help="number of copies (default: 6)")
+    p.add_argument("--copies", default="6",
+                   help="number of copies: one number for a single image; with "
+                        "several images, comma-separated quantities matching the "
+                        "image order (default: 6 per image)")
     p.add_argument("--columns", type=int, default=6,
-                   help="photos per row (default: 6; extra copies wrap to a second row)")
+                   help="photos per row (default: 6; extra copies wrap to a "
+                        "second row and extra pages)")
     p.add_argument("--photo-width", type=float, default=None, metavar="SIZE",
                    help="photo width (default: 85.79 pt ≈ 30.3 mm)")
     p.add_argument("--photo-height", type=float, default=None, metavar="SIZE",
                    help="photo height (default: 114.14 pt ≈ 40.3 mm)")
     p.add_argument("--spacing-x", type=float, default=None, metavar="SIZE",
-                   help="horizontal gap between photos (default: 6 pt)")
+                   help="horizontal gap between photos (default: 0 pt, zero-gap)")
     p.add_argument("--spacing-y", type=float, default=None, metavar="SIZE",
-                   help="vertical gap between rows (default: 12 pt)")
+                   help="vertical gap between rows (default: 0 pt, zero-gap)")
     p.add_argument("--top-margin", type=float, default=None, metavar="SIZE",
                    help="top margin (default: 30 pt)")
     p.add_argument("--left-margin", type=float, default=None, metavar="SIZE",
@@ -449,16 +729,27 @@ def default_output_path(image_path: Path) -> Path:
     return image_path.with_name(image_path.stem + "_sheet.pdf")
 
 
-def check_output_not_input(image_path: Path, output_path: Path) -> None:
-    """Raise ValueError if the output would overwrite the input photograph."""
+def check_output_not_input(
+    image_path: Path | Sequence[Path], output_path: Path
+) -> None:
+    """Raise ValueError if the output would overwrite any input photograph."""
+    paths = (
+        [Path(image_path)] if isinstance(image_path, Path)
+        else [Path(p) for p in image_path]
+    )
     try:
-        if output_path.resolve() == image_path.resolve():
-            raise ValueError(
-                "The output PDF would overwrite the input photograph. "
-                "Choose a different output path."
-            )
+        output = output_path.resolve()
     except OSError:
-        pass  # let later validation report the problem
+        return  # let later validation report the problem
+    for candidate in paths:
+        try:
+            if output == candidate.resolve():
+                raise ValueError(
+                    "The output PDF would overwrite the input photograph. "
+                    "Choose a different output path."
+                )
+        except OSError:
+            pass  # let later validation report the problem
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -474,12 +765,12 @@ def main(argv: list[str] | None = None) -> int:
     config = LayoutConfig(
         paper=args.paper,
         orientation=args.orientation,
-        copies=args.copies,
+        copies=6,  # set below from the parsed quantities
         columns=args.columns,
         photo_width=size(args.photo_width, 85.79),
         photo_height=size(args.photo_height, 114.14),
-        spacing_x=size(args.spacing_x, 6.0),
-        spacing_y=size(args.spacing_y, 12.0),
+        spacing_x=size(args.spacing_x, DEFAULT_SPACING_X),
+        spacing_y=size(args.spacing_y, DEFAULT_SPACING_Y),
         top_margin=size(args.top_margin, 30.0),
         left_margin=size(args.left_margin, 30.0),
         right_margin=size(args.right_margin, 30.0),
@@ -487,16 +778,44 @@ def main(argv: list[str] | None = None) -> int:
         fit_to_page=args.fit_to_page,
     )
 
-    image_path: Path = args.image
-    output_path: Path = args.output or default_output_path(image_path)
+    image_paths: list[Path] = list(args.image)
+    output_path: Path = args.output or default_output_path(image_paths[0])
     try:
-        check_output_not_input(image_path, output_path)
+        check_output_not_input(image_paths, output_path)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    # --- Parse per-image quantities ------------------------------------------
+    try:
+        if "," in args.copies:
+            parts = [part.strip() for part in args.copies.split(",") if part.strip()]
+            quantities = [int(part) for part in parts]
+            if len(quantities) != len(image_paths):
+                raise ValueError(
+                    "--copies takes one comma-separated quantity per image "
+                    f"({len(image_paths)} images, {len(quantities)} quantities)."
+                )
+            if any(q < 1 for q in quantities):
+                raise ValueError("Each image needs at least 1 copy.")
+            config.copies = max(quantities)
+        else:
+            shared = int(args.copies)
+            if shared < 1:
+                raise ValueError("Each image needs at least 1 copy.")
+            if len(image_paths) > 1:
+                raise ValueError(
+                    "--copies takes one comma-separated quantity per image "
+                    f"({len(image_paths)} images), e.g. --copies 6,3,2."
+                )
+            quantities = [shared]
+            config.copies = shared
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     try:
-        summary = generate_pdf(image_path, output_path, config)
+        summary = generate_pdf(image_paths, output_path, config, quantities)
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -521,11 +840,12 @@ def main(argv: list[str] | None = None) -> int:
             " (--fit-to-page reduced the requested size to "
             f"{pt_to_mm(w):.1f} × {pt_to_mm(h):.1f} mm, aspect ratio preserved)"
         )
+    pages_note = f", {summary['pages']} page(s)" if summary["pages"] > 1 else ""
     print(f"PDF written: {summary['output'].resolve()}")
     print(
         f"  page {pw:.0f} × {ph:.0f} pt, {summary['placements']} photos of "
         f"{w:.2f} × {h:.2f} pt ({pt_to_mm(w):.1f} × {pt_to_mm(h):.1f} mm) "
-        f"in {config.rows()} row(s){note}"
+        f"in {config.rows()} row(s){pages_note}{note}"
     )
     return 0
 

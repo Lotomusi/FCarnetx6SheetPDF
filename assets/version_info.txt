@@ -6,8 +6,8 @@
 #
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -22,13 +22,13 @@ VSVersionInfo(
           "040904B0",
           [
             StringStruct("CompanyName", "Carnet Photo Sheet Maker"),
-            StringStruct("FileDescription", "Carnet Photo Sheet Maker — print-ready sheets of six identical carnet photos"),
-            StringStruct("FileVersion", "1.0.0.0"),
+            StringStruct("FileDescription", "Carnet Photo Sheet Maker — print-ready zero-gap sheets of carnet photos, one or more images per job"),
+            StringStruct("FileVersion", "1.1.0.0"),
             StringStruct("InternalName", "CarnetSheetMaker"),
             StringStruct("LegalCopyright", "© 2026 Carnet Photo Sheet Maker contributors"),
             StringStruct("OriginalFilename", "CarnetSheetMaker.exe"),
             StringStruct("ProductName", "Carnet Photo Sheet Maker"),
-            StringStruct("ProductVersion", "1.0.0.0"),
+            StringStruct("ProductVersion", "1.1.0.0"),
           ],
         )
       ]

@@ -85,7 +85,7 @@ def _page_mediabox(data: bytes) -> tuple[float, float]:
 
 
 def _image_draw_operations(content: bytes) -> list[tuple[float, float, float, float]]:
-    """Return (x, y, w, h) for every 'cm ... Do' image placement on the page.
+    r"""Return (x, y, w, h) for every 'cm ... Do' image placement on the page.
 
     ReportLab emits, per placement, a transformation matrix immediately
     before the XObject invoke:  w 0 0 h x y cm  /Ixx Do
@@ -419,6 +419,222 @@ class TestCliUnits(BaseTestCase):
         # Same geometry as the point-default run.
         self.assertAlmostEqual(ops[0][2], 114.14 * 3 / 4, places=2)
         self.assertAlmostEqual(ops[0][3], 114.14, places=2)
+
+
+class TestZeroGapSpacing(BaseTestCase):
+    """Adjacent carnet photos must have zero intentional spacing."""
+
+    def test_default_spacing_is_zero(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        self.assertEqual(config.spacing_x, 0.0)
+        self.assertEqual(config.spacing_y, 0.0)
+
+    def test_adjacent_photos_touch_horizontally(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        layout = carnet_sheet.compute_layout(config, CARNET_ASPECT)
+        rects = carnet_sheet.placement_rects(layout, config)
+        self.assertEqual(len(rects), 6)
+        for left, right in zip(rects, rects[1:]):
+            gap = right[0] - (left[0] + left[2])
+            self.assertAlmostEqual(gap, 0.0, places=6)
+
+    def test_adjacent_rows_touch_vertically(self) -> None:
+        config = carnet_sheet.LayoutConfig(copies=12, columns=6)
+        layout = carnet_sheet.compute_layout(config, CARNET_ASPECT)
+        rects = carnet_sheet.placement_rects(layout, config)
+        ys = sorted({round(y, 6) for _x, y, _w, _h in rects}, reverse=True)
+        self.assertEqual(len(ys), 2)
+        # Both rows have the same photo height, so row gap = 0 means the
+        # vertical distance between row tops equals the photo height.
+        self.assertAlmostEqual(ys[0] - ys[1], rects[0][3], places=6)
+
+    def test_cli_default_produces_zero_gap_pdf(self) -> None:
+        out = self.tmp / "zero.pdf"
+        rc = carnet_sheet.main([str(self.photo), "-o", str(out)])
+        self.assertEqual(rc, 0)
+        ops = _image_draw_operations(_page_content(out.read_bytes()))
+        self.assertEqual(len(ops), 6)
+        ops_sorted = sorted(ops, key=lambda op: op[0])
+        for left, right in zip(ops_sorted, ops_sorted[1:]):
+            gap = right[0] - (left[0] + left[2])
+            self.assertAlmostEqual(gap, 0.0, places=4)
+
+    def test_explicit_spacing_is_still_honoured(self) -> None:
+        config = carnet_sheet.LayoutConfig(spacing_x=6.0)
+        layout = carnet_sheet.compute_layout(config, CARNET_ASPECT)
+        rects = carnet_sheet.placement_rects(layout, config)
+        gap = rects[1][0] - (rects[0][0] + rects[0][2])
+        self.assertAlmostEqual(gap, 6.0, places=6)
+
+    def test_margins_preserved_with_zero_gap(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        layout = carnet_sheet.compute_layout(config, CARNET_ASPECT)
+        pw, ph = config.paper_dimensions()
+        # Top margin unchanged.
+        self.assertAlmostEqual(layout.y_top, ph - 30.0, places=6)
+        # Content strip still horizontally centered between the margins.
+        left_gap = layout.x0 - config.left_margin
+        right_gap = (pw - config.right_margin) - (layout.x0 + layout.content_width)
+        self.assertAlmostEqual(left_gap, right_gap, places=6)
+
+
+class TestMultiImage(BaseTestCase):
+    """Multiple source images, each with its own copy quantity."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.photo_b = self.tmp / "photo_b.png"
+        make_photo(self.photo_b, size=(300, 400), color=(40, 120, 40))  # 3:4
+        self.photo_c = self.tmp / "photo_c.png"
+        make_photo(self.photo_c, size=(600, 600), color=(40, 40, 120))  # 1:1
+
+    def test_default_quantity_is_six(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        pages = carnet_sheet.placement_plan([[CARNET_ASPECT] * 6], config)
+        self.assertEqual(sum(len(p.placements) for p in pages), 6)
+
+    def test_requested_copies_for_every_image(self) -> None:
+        out = self.tmp / "multi.pdf"
+        summary = carnet_sheet.generate_pdf(
+            [self.photo, self.photo_b, self.photo_c], out,
+            carnet_sheet.LayoutConfig(), quantities=[6, 6, 3],
+        )
+        self.assertEqual(summary["placements"], 15)
+        self.assertEqual(summary["pages"], 1)
+
+    def test_sequential_row_major_ordering(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        pages = carnet_sheet.placement_plan(
+            [[CARNET_ASPECT] * 6, [CARNET_ASPECT] * 4, [CARNET_ASPECT] * 2], config
+        )
+        sequence = [p.job_index for p in pages[0].placements]
+        self.assertEqual(sequence, [0] * 6 + [1] * 4 + [2] * 2)
+
+    def test_multiple_images_share_one_sheet(self) -> None:
+        config = carnet_sheet.LayoutConfig()
+        pages = carnet_sheet.placement_plan(
+            [[CARNET_ASPECT] * 6, [CARNET_ASPECT] * 6, [CARNET_ASPECT] * 3], config
+        )
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(len(pages[0].placements), 15)
+        # All inside the page.
+        pw, ph = config.paper_dimensions()
+        for p in pages[0].placements:
+            self.assertGreaterEqual(p.x, 0)
+            self.assertGreaterEqual(p.y, 0)
+            self.assertLessEqual(p.x + p.width, pw + 1e-6)
+            self.assertLessEqual(p.y + p.height, ph + 1e-6)
+
+    def test_pagination_to_additional_pages(self) -> None:
+        # 14+13+13 = 40 placements; a letter page below a 30 pt top margin
+        # fits 6 rows of 114.14 pt → 36 per page → 2 pages (36 + 4).
+        out = self.tmp / "two_pages.pdf"
+        summary = carnet_sheet.generate_pdf(
+            [self.photo, self.photo_b, self.photo_c], out,
+            carnet_sheet.LayoutConfig(), quantities=[14, 13, 13],
+        )
+        self.assertEqual(summary["pages"], 2)
+        self.assertEqual(summary["placements"], 40)
+        # Page objects in the PDF.
+        data = out.read_bytes()
+        page_objs = [
+            b for b in _pdf_objects(data).values()
+            if b"/Type /Page" in b and b"/Pages" not in b
+        ]
+        self.assertEqual(len(page_objs), 2)
+
+    def test_each_image_embedded_with_its_own_pixels(self) -> None:
+        out = self.tmp / "embeds.pdf"
+        carnet_sheet.generate_pdf(
+            [self.photo, self.photo_c], out,
+            carnet_sheet.LayoutConfig(), quantities=[2, 3],
+        )
+        images = _xobject_images(out.read_bytes())
+        sizes = sorted((im["width"], im["height"]) for im in images)
+        self.assertEqual(sizes, [(600, 600), (600, 800)])
+
+    def test_single_image_with_explicit_quantities(self) -> None:
+        out = self.tmp / "four.pdf"
+        summary = carnet_sheet.generate_pdf(
+            self.photo, out, carnet_sheet.LayoutConfig(), quantities=[4]
+        )
+        self.assertEqual(summary["placements"], 4)
+
+    def test_quantities_length_mismatch_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            carnet_sheet.generate_pdf(
+                [self.photo, self.photo_b], self.tmp / "x.pdf",
+                carnet_sheet.LayoutConfig(), quantities=[6],
+            )
+
+    def test_non_positive_quantity_raises(self) -> None:
+        with self.assertRaises(carnet_sheet.LayoutError):
+            carnet_sheet.generate_pdf(
+                [self.photo, self.photo_b], self.tmp / "x.pdf",
+                carnet_sheet.LayoutConfig(), quantities=[6, 0],
+            )
+
+    def test_missing_second_image_reports_error(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            carnet_sheet.generate_pdf(
+                [self.photo, self.tmp / "missing.png"], self.tmp / "x.pdf",
+                carnet_sheet.LayoutConfig(), quantities=[6, 6],
+            )
+
+    def test_multi_image_pdf_keeps_zero_gap_and_borders(self) -> None:
+        out = self.tmp / "gap.pdf"
+        carnet_sheet.generate_pdf(
+            [self.photo, self.photo_b], out,
+            carnet_sheet.LayoutConfig(), quantities=[6, 6],
+        )
+        content = _page_content(out.read_bytes())
+        ops = sorted(
+            _image_draw_operations(content), key=lambda op: (op[1], op[0])
+        )
+        self.assertEqual(len(ops), 12)
+        # Same-row neighbours touch (rows share y within tolerance).
+        for left, right in zip(ops, ops[1:]):
+            same_row = abs(left[1] - right[1]) < 1e-4
+            if same_row:
+                gap = right[0] - (left[0] + left[2])
+                self.assertAlmostEqual(gap, 0.0, places=4)
+        self.assertGreaterEqual(len(_rect_stroke_operations(content)), 12)
+
+
+class TestMultiImageCli(BaseTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.photo_b = self.tmp / "photo_b.png"
+        make_photo(self.photo_b, size=(300, 400), color=(40, 120, 40))
+
+    def test_cli_copies_list_per_image(self) -> None:
+        out = self.tmp / "cli_multi.pdf"
+        rc = carnet_sheet.main(
+            [str(self.photo), str(self.photo_b), "--copies", "2,1", "-o", str(out)]
+        )
+        self.assertEqual(rc, 0)
+        ops = _image_draw_operations(_page_content(out.read_bytes()))
+        self.assertEqual(len(ops), 3)
+
+    def test_cli_copies_count_mismatch_errors(self) -> None:
+        rc = carnet_sheet.main(
+            [str(self.photo), str(self.photo_b), "--copies", "5",
+             "-o", str(self.tmp / "x.pdf")]
+        )
+        self.assertEqual(rc, 2)
+
+    def test_cli_rejects_zero_quantity(self) -> None:
+        rc = carnet_sheet.main(
+            [str(self.photo), "--copies", "0", "-o", str(self.tmp / "x.pdf")]
+        )
+        self.assertEqual(rc, 2)
+
+    def test_cli_single_image_still_defaults_to_six(self) -> None:
+        out = self.tmp / "cli_single.pdf"
+        rc = carnet_sheet.main([str(self.photo), "-o", str(out)])
+        self.assertEqual(rc, 0)
+        ops = _image_draw_operations(_page_content(out.read_bytes()))
+        self.assertEqual(len(ops), 6)
 
 
 class TestGeometryHelpers(BaseTestCase):
