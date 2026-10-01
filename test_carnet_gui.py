@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -253,6 +254,30 @@ class TestCarnetGUI(unittest.TestCase):
         entry = self.gui._size_entries[str(self.gui.var_photo_width)]
         self.assertIn("<Key-Up>", entry.bind())
         self.assertIn("<Shift-Key-Up>", entry.bind())
+
+    def test_uxcheck_cli_mode_routes(self) -> None:
+        # --uxcheck [OUT_PDF] [PHOTO] routes to run_uxcheck; the check run
+        # itself needs a display + mainloop, so only the routing is tested.
+        import carnet_gui
+
+        with mock.patch.object(carnet_gui, "run_uxcheck", return_value=7) as run:
+            code = carnet_gui.main(["--uxcheck", "out.pdf", "photo.png"])
+        self.assertEqual(code, 7)
+        run.assert_called_once_with("out.pdf", "photo.png")
+        with mock.patch.object(carnet_gui, "run_uxcheck", return_value=0) as run2:
+            self.assertEqual(carnet_gui.main(["--uxcheck", "out.pdf"]), 0)
+        run2.assert_called_once_with("out.pdf", None)
+
+    def test_uxcheck_photo_is_generated(self) -> None:
+        # --uxcheck without a photo argument generates its own 3:4 image.
+        import carnet_gui
+
+        target = self.tmp / "generated.png"
+        carnet_gui._make_uxcheck_photo(target)
+        from PIL import Image
+
+        with Image.open(target) as img:
+            self.assertEqual(img.size, (600, 800))
 
     def test_invalid_number_raises_actionable_layout_error(self) -> None:
         self.gui.var_photo_width.set("abc")

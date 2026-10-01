@@ -106,6 +106,29 @@ A binary built with Windows Python 3.12 + PyInstaller is included as
 version metadata). Its version resource reads 1.2.0.0. Rebuild any time
 with either option above to pick up code changes.
 
+#### Verifying the exe on a Windows machine
+
+The exe has two built-in test hooks (no Python needed):
+
+- **`CarnetSheetMaker.exe --selftest PHOTO OUT_PDF`** — full export smoke
+  test: builds the window, generates a real PDF through the Generate
+  button, writes `SELFTEST-OK` to `OUT_PDF.selftest.log`.
+- **`CarnetSheetMaker.exe --uxcheck OUT_PDF`** — 47-point UX check of the
+  size-field controls: presets, arrow-key nudging (±0.5 mm, Shift ±0.1 mm),
+  red invalid-field labels, comma decimals, the live fit summary, and three
+  real exports (default, overflowing tweak, invalid settings). Pops a
+  summary dialog (`UX-CHECK-OK`) and writes per-step results to
+  `OUT_PDF.uxcheck.log`. Runs against an isolated settings store, so your
+  own remembered settings are untouched. An optional third argument uses
+  your own photo instead of a generated one, and `UXCHECK_NO_DIALOG=1`
+  skips the summary dialog (used by automated runs).
+
+Quick manual spot-check after downloading a new build: open the exe →
+pick the "ID-2 35×45" preset (fields become 35.0000/45.0000) → press ↑ on
+a size field (value +0.5 mm) → type "abc" in spacing (label turns red) →
+add a photo, Generate (overflowing sizes shrink to fit instead of
+erroring).
+
 > Note: Windows SmartScreen may warn about the exe ("Windows protected
 > your PC"). Code signing removes this once the certificate has built
 > reputation — see **`docs/CODE_SIGNING.md`** for the setup (Azure
@@ -300,7 +323,7 @@ Inside its cell, the photograph is embedded at **its own aspect ratio**
 
 ## Validation
 
-Run the acceptance test suite (59 engine/CLI tests plus 55 GUI tests,
+Run the acceptance test suite (59 engine/CLI tests plus 57 GUI tests,
 stdlib `unittest` only; GUI tests skip automatically when tkinter or a
 display is unavailable):
 

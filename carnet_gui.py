@@ -1250,7 +1250,7 @@ def _enable_windows_dpi_awareness() -> None:
         pass  # older Windows version or awareness already set
 
 
-def _selftest_log_stream(out_pdf: Path):
+def _selftest_log_stream(out_pdf: Path, suffix: str = ".selftest.log"):
     """Open the selftest log next to the output PDF (always, not stdout).
 
     Windowed exes may have unusable/None stdio handles (wine raises
@@ -1258,7 +1258,7 @@ def _selftest_log_stream(out_pdf: Path):
     test harness can read regardless of how the exe was launched.
     """
     log_path = Path(
-        os.environ.get("SELFTEST_LOG", str(out_pdf.with_suffix(".selftest.log")))
+        os.environ.get("SELFTEST_LOG", str(out_pdf.with_suffix(suffix)))
     )
     try:
         stream = open(log_path, "w", encoding="utf-8", buffering=1)
@@ -1325,14 +1325,316 @@ def run_selftest(photo: str, out_pdf: str, timeout: float = 60.0) -> int:
     return 1
 
 
+def _make_uxcheck_photo(path: Path) -> Path:
+    """Create a plain 3:4 test photo so --uxcheck needs no input file."""
+    from PIL import Image
+
+    Image.new("RGB", (600, 800), (52, 96, 168)).save(path, format="PNG")
+    return path
+
+
+def run_uxcheck(out_pdf: str, photo: str | None = None, timeout: float = 120.0) -> int:
+    """UX test hook for the frozen exe: exercises the real GUI objects.
+
+    Drives the actual Tk variables and handlers — size presets, arrow-key
+    nudging, red-field validation, comma decimals, the live fit summary,
+    and three real threaded on_generate runs (default, overflowing tweak,
+    invalid settings) — then reports UX-CHECK-OK plus a summary dialog.
+    Per-step results land in ``OUT_PDF.uxcheck.log`` next to the PDF.
+    Runs against an isolated settings store; the user's config is untouched.
+    """
+    import shutil
+    import tempfile
+    import time as _time
+    import tkinter.messagebox as messagebox
+
+    out = Path(out_pdf)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    log_stream = _selftest_log_stream(out, suffix=".uxcheck.log")
+    real_showinfo = messagebox.showinfo
+
+    failures: list[str] = []
+    counter = {"n": 0}
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        counter["n"] += 1
+        print(
+            f"UX-STEP {counter['n']:02d} {'PASS' if cond else 'FAIL'} {name}"
+            + ("" if cond or not detail else f" :: {detail}")
+        )
+        if not cond:
+            failures.append(f"{name} ({detail})" if detail else name)
+
+    def close(a: float, b: float, tol: float = 1e-6) -> bool:
+        return abs(a - b) <= tol
+
+    dialogs: dict = {"error": [], "info": []}
+    messagebox.showerror = (
+        lambda title, msg=None, **k: dialogs["error"].append(str(title)) or "ok"
+    )
+    messagebox.showinfo = (
+        lambda title, msg=None, **k: dialogs["info"].append(str(title)) or "ok"
+    )
+    messagebox.askyesno = lambda *a, **k: False
+
+    tmp = Path(tempfile.mkdtemp(prefix="uxcheck_"))
+    photo_path = Path(photo) if photo else _make_uxcheck_photo(tmp / "ux_photo.png")
+    print(f"uxcheck start: photo={photo_path} out={out}")
+
+    root = tk.Tk()
+    root.withdraw()
+    store = SettingsStore(tmp / "settings.json")
+    gui = CarnetSheetGUI(root, store=store)
+    root.update()
+
+    def pump_generation() -> None:
+        """Pump the real threaded on_generate flow to completion."""
+        deadline = _time.monotonic() + timeout
+
+        def done_check() -> None:
+            if not gui._generation_lock.locked():
+                root.quit()
+                return
+            if _time.monotonic() > deadline:
+                print("UX-TIMEOUT waiting for generation")
+                root.quit()
+                return
+            root.after(50, done_check)
+
+        root.after(50, done_check)
+        root.mainloop()
+
+    def run_to(path: Path) -> None:
+        gui.output_path = path
+        gui.var_output.set(str(path))
+        gui.on_generate()
+        pump_generation()
+
+    def pdf_ok(path: Path) -> bool:
+        return path.exists() and path.read_bytes()[:5] == b"%PDF-"
+
+    try:
+        # --- 1. Defaults ------------------------------------------------ #
+        default_w = format_mm("photo_width", DEFAULTS_MM["photo_width"])
+        check("defaults in width field", gui.var_photo_width.get() == default_w,
+              gui.var_photo_width.get())
+        check("preset label shows default",
+              gui.var_preset.get() == SIZE_PRESETS[0][0], gui.var_preset.get())
+        check("shrink-to-fit checkbox on", bool(gui.var_fit.get()))
+        check("empty list -> empty fit summary", gui.var_fit_summary.get() == "",
+              gui.var_fit_summary.get())
+
+        # --- 2. Preset selection drives fields + config ------------------ #
+        for name, w, h in SIZE_PRESETS:
+            gui.var_preset.set(name)
+            gui._on_preset_selected()
+            check(f"preset '{name}' width",
+                  gui.var_photo_width.get() == format_mm("photo_width", w),
+                  gui.var_photo_width.get())
+            check(f"preset '{name}' height",
+                  gui.var_photo_height.get() == format_mm("photo_height", h),
+                  gui.var_photo_height.get())
+            cfg = gui.build_config()
+            # format_mm displays 4 decimals, so round-tripping the stock
+            # size differs from the point default by <1e-3 pt.
+            check(f"preset '{name}' config pts",
+                  close(cfg.photo_width, mm_to_pt(w), 1e-3)
+                  and close(cfg.photo_height, mm_to_pt(h), 1e-3),
+                  f"{cfg.photo_width} {cfg.photo_height}")
+
+        # --- 3. Field edits sync the preset picker ------------------------ #
+        gui.var_photo_width.set("36")
+        gui._on_size_edited()
+        check("edited width -> preset Custom",
+              gui.var_preset.get() == PRESET_CUSTOM, gui.var_preset.get())
+        gui.var_photo_width.set(format_mm("photo_width", 35.0))
+        gui.var_photo_height.set(format_mm("photo_height", 45.0))
+        gui._on_size_edited()
+        check("typed 35x45 -> preset ID-2",
+              gui.var_preset.get() == SIZE_PRESETS[1][0], gui.var_preset.get())
+
+        # --- 4. Invalid fields turn labels red, then recover -------------- #
+        gui.var_spacing_x.set("abc")
+        gui._refresh_field_validation()
+        label = gui._size_labels[str(gui.var_spacing_x)]
+        check("non-numeric field red",
+              str(label.cget("foreground")) == "#e02020",
+              str(label.cget("foreground")))
+        gui.var_spacing_x.set("-2")
+        gui._refresh_field_validation()
+        check("negative field red",
+              str(label.cget("foreground")) == "#e02020",
+              str(label.cget("foreground")))
+        gui.var_spacing_x.set(format_mm("spacing_x", DEFAULTS_MM["spacing_x"]))
+        gui._refresh_field_validation()
+        check("valid field back to normal",
+              str(label.cget("foreground")) == "#404040",
+              str(label.cget("foreground")))
+
+        # --- 4b. Zero photo size is invalid; zero spacing is fine ---------- #
+        width_label = gui._size_labels[str(gui.var_photo_width)]
+        gui.var_photo_width.set("0")
+        gui._refresh_field_validation()
+        check("zero photo width red",
+              str(width_label.cget("foreground")) == "#e02020",
+              str(width_label.cget("foreground")))
+        try:
+            gui.build_config()
+            check("zero photo size rejected by build_config", False, "no exception")
+        except Exception as exc:
+            check("zero photo size rejected by build_config",
+                  type(exc).__name__ == "LayoutError", f"{type(exc).__name__}: {exc}")
+        gui.var_photo_width.set(format_mm("photo_width", DEFAULTS_MM["photo_width"]))
+        gui._refresh_field_validation()
+        check("zero photo width recovers",
+              str(width_label.cget("foreground")) == "#404040",
+              str(width_label.cget("foreground")))
+
+        # --- 5. Comma decimals (Spanish keyboards) ------------------------- #
+        check("parse_mm comma", close(parse_mm("35,5"), 35.5), str(parse_mm("35,5")))
+        gui.var_photo_width.set("35,5")
+        cfg = gui.build_config()
+        check("comma accepted by build_config",
+              close(cfg.photo_width, mm_to_pt(35.5)), str(cfg.photo_width))
+        gui._on_size_edited()  # must not raise
+        root.update()
+
+        # --- 6. Nudge math (handler called directly) ----------------------- #
+        gui.var_photo_width.set("30.0")
+        gui._nudge_size(gui.var_photo_width, +0.5)
+        check("nudge +0.5", gui.var_photo_width.get() == "30.5",
+              gui.var_photo_width.get())
+        gui._nudge_size(gui.var_photo_width, -0.5)
+        check("nudge -0.5", gui.var_photo_width.get() == "30.0",
+              gui.var_photo_width.get())
+        gui.var_photo_height.set("40.0")
+        gui._nudge_size(gui.var_photo_height, +0.1)  # Shift = fine step
+        check("shift nudge +0.1", gui.var_photo_height.get() == "40.1",
+              gui.var_photo_height.get())
+        gui.var_photo_height.set("0.0")
+        gui._nudge_size(gui.var_photo_height, -0.5)
+        check("nudge clamps at 0", gui.var_photo_height.get() == "0.0",
+              gui.var_photo_height.get())
+        gui.var_photo_width.set("abc")
+        gui._nudge_size(gui.var_photo_width, +0.5)
+        check("nudge ignores invalid input", gui.var_photo_width.get() == "abc",
+              gui.var_photo_width.get())
+
+        # --- 7. Arrow-key bindings present on the size entries ------------- #
+        entry = gui._size_entries[str(gui.var_photo_width)]
+        for seq in ("<Key-Up>", "<Shift-Key-Up>", "<Key-Down>", "<Shift-Key-Down>"):
+            check(f"binding {seq}", bool(entry.bind(seq)), str(entry.bind(seq)))
+
+        # --- 8. Live fit summary: fits / shrink / too-large / invalid ------ #
+        gui.add_photo(photo_path)  # default quantity 6
+        root.update()
+        gui.var_photo_width.set(format_mm("photo_width", DEFAULTS_MM["photo_width"]))
+        gui.var_photo_height.set(format_mm("photo_height", DEFAULTS_MM["photo_height"]))
+        gui._update_fit_summary()
+        check("summary fits on one page",
+              "fits on one page." in gui.var_fit_summary.get(),
+              gui.var_fit_summary.get())
+
+        gui.var_photo_width.set("200")
+        gui.var_photo_height.set("250")
+        gui._update_fit_summary()
+        check("summary overflow (fit on) announces shrink",
+              "the export will shrink them to" in gui.var_fit_summary.get(),
+              gui.var_fit_summary.get())
+
+        gui.var_fit.set(False)  # exact preview -> placement_plan raises
+        gui._update_fit_summary()
+        check("summary overflow (fit off) says too large",
+              "too large for" in gui.var_fit_summary.get()
+              and "the export will shrink them to fit." in gui.var_fit_summary.get(),
+              gui.var_fit_summary.get())
+        gui.var_fit.set(True)
+
+        gui.var_spacing_x.set("abc")
+        gui._update_fit_summary()
+        check("summary empty on invalid field", gui.var_fit_summary.get() == "",
+              gui.var_fit_summary.get())
+        gui.var_spacing_x.set(format_mm("spacing_x", DEFAULTS_MM["spacing_x"]))
+
+        # --- 9. Bug 1: overflowing tweak must not fail the export ---------- #
+        dialogs["error"].clear()
+        gui.var_photo_width.set("200")
+        gui.var_photo_height.set("250")
+        run_to(out.with_name("ux_overflow.pdf"))
+        check("overflow tweak generates PDF", pdf_ok(out.with_name("ux_overflow.pdf")),
+              f"exists={out.with_name('ux_overflow.pdf').exists()}")
+        check("overflow tweak: no error dialog", not dialogs["error"],
+              str(dialogs["error"]))
+        check("overflow tweak: no invalid-settings note", gui._settings_note == "",
+              gui._settings_note)
+        check("overflow tweak: status not failed",
+              "failed" not in gui.status.get().lower(), gui.status.get())
+
+        # --- 10. Invalid field + Generate falls back to stock settings ----- #
+        dialogs["error"].clear()
+        gui.var_spacing_x.set("abc")
+        run_to(out.with_name("ux_fallback.pdf"))
+        check("invalid settings still generate PDF", pdf_ok(out.with_name("ux_fallback.pdf")),
+              f"exists={out.with_name('ux_fallback.pdf').exists()}")
+        check("invalid settings: no error dialog", not dialogs["error"],
+              str(dialogs["error"]))
+        check("invalid settings: status note shown",
+              "ignored invalid settings" in gui._settings_note, gui._settings_note)
+        gui.var_spacing_x.set(format_mm("spacing_x", DEFAULTS_MM["spacing_x"]))
+
+        # --- 11. Normal default flow through the real Generate button ------ #
+        dialogs["error"].clear()
+        gui.var_photo_width.set(format_mm("photo_width", DEFAULTS_MM["photo_width"]))
+        gui.var_photo_height.set(format_mm("photo_height", DEFAULTS_MM["photo_height"]))
+        run_to(out)
+        check("default flow generates PDF", pdf_ok(out), f"exists={out.exists()}")
+        check("default flow: no error dialog", not dialogs["error"],
+              str(dialogs["error"]))
+        check("default flow: clean settings note", gui._settings_note == "",
+              gui._settings_note)
+        check("default flow: status mentions photos",
+              "photos" in gui.status.get().lower(), gui.status.get())
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    ok = not failures
+    print(f"UX-RESULT {'OK' if ok else 'FAIL'} "
+          f"({counter['n']} checks, {len(failures)} failures)")
+    for name in failures:
+        print(f"UX-RESULT FAIL {name}")
+
+    verdict = (f"UX-CHECK-{'OK' if ok else 'FAIL'}\n\n"
+               f"{counter['n'] - len(failures)} of {counter['n']} checks passed.")
+    if failures:
+        verdict += "\n\n" + "\n".join("FAIL " + f for f in failures[:12])
+        if len(failures) > 12:
+            verdict += f"\n... and {len(failures) - 12} more (see the .uxcheck.log)"
+    verdict += f"\n\nLog: {out.with_suffix('.uxcheck.log')}"
+    if not os.environ.get("UXCHECK_NO_DIALOG"):
+        # Automation hook (CI/wine) sets UXCHECK_NO_DIALOG to skip the
+        # modal verdict dialog, which would block with nobody to click it.
+        real_showinfo("UX check", verdict)
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     _enable_windows_dpi_awareness()
 
     args = sys.argv[1:] if argv is None else argv
     if len(args) >= 2 and args[0] == "--selftest":
         return run_selftest(args[1], args[2])
+    if len(args) >= 2 and args[0] == "--uxcheck":
+        return run_uxcheck(args[1], args[2] if len(args) >= 3 else None)
     if args:
-        print("usage: CarnetSheetMaker.exe [--selftest PHOTO OUT_PDF]", file=sys.stderr)
+        print(
+            "usage: CarnetSheetMaker.exe [--selftest PHOTO OUT_PDF] "
+            "[--uxcheck OUT_PDF]",
+            file=sys.stderr,
+        )
         return 2
 
     root = tk.Tk()
