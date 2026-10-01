@@ -103,7 +103,7 @@ smoke-tests that it launches, and uploads it as a downloadable artifact.
 
 A binary built with Windows Python 3.12 + PyInstaller is included as
 `CarnetSheetMaker.exe` (≈20 MB, single file, windowed, with icon and
-version metadata). Its version resource reads 1.0.0.0. Rebuild any time
+version metadata). Its version resource reads 1.2.0.0. Rebuild any time
 with either option above to pick up code changes.
 
 > Note: Windows SmartScreen may warn about the exe ("Windows protected
@@ -129,15 +129,28 @@ python carnet_gui.py      # Windows
 2. Optionally adjust the settings (all sizes in millimetres), the paper
    size, orientation and columns. **Remove selected** / **Clear all**
    manage the list; a photo's copies can be edited at any time.
-3. Click **Generate PDF**. Validation errors (no photo, layout that
-   does not fit, non-numeric entries) appear as dialogs, never as a broken
-   PDF.
+
+   The size fields are forgiving: a **size preset** picker offers the
+   stock 30×40 mm carnet geometry plus common ID sizes; typing a
+   non-number turns the field red instead of failing the export; comma
+   decimal separators ("35,5") are accepted; **↑/↓** nudges a field by
+   0.5 mm (**Shift** for 0.1 mm); and a live line under the fields shows
+   whether the tweak fits the page, the resulting photo size, and the
+   page count before you commit to generating.
+3. Click **Generate PDF**. Missing photos and unreadable files appear as
+   dialogs, never as a broken PDF. Size tweaks that do not fit the page
+   are shrunk to fit automatically (the status line tells you the final
+   size); a field left blank or non-numeric falls back to the stock
+   setting with a note instead of blocking the export.
 4. On success the status line reports the exact geometry, and you are
    offered to open the PDF in the system's default viewer
    (`os.startfile` on Windows, `xdg-open`/Okular/Evince on Linux).
 
 The window is deliberately minimal; the checkbox **Shrink to fit page
-instead of erroring** corresponds to the CLI's `--fit-to-page`.
+instead of erroring** (on by default) keeps exports working when tweaked
+sizes overflow the page — untick it to preview the exact, possibly
+overflowing geometry with a warning. The CLI always previews/errors
+exactly and needs `--fit-to-page` for the same behaviour.
 
 ### Live preview
 
@@ -154,7 +167,8 @@ layout engine as the PDF, so what you see is what will be generated.
 
 Your layout settings, the photo list (paths and per-photo quantities) and
 the last output folder persist between sessions in the per-user config
-directory:
+directory (the shrink-to-fit choice is deliberately not persisted: it is
+always on for generation):
 
 - Windows: `%APPDATA%\CarnetSheetMaker\settings.json`
 - Linux: `~/.config/CarnetSheetMaker/settings.json`
@@ -257,25 +271,36 @@ are unchanged, and `--spacing-x` / `--spacing-y` still exist for anyone
 who wants a gap — they simply default to 0 now. Thin cutting borders
 (on by default) remain the visual guide for scissors.
 
-### How sizing works (aspect-ratio guarantee)
+### How sizing works (exact cells, aspect-true photos)
 
-The photograph is always drawn at **its own aspect ratio**, contained
-inside the configured photo box:
+Every photo cell is laid out at **exactly** the configured photo size —
+whatever the photograph's aspect ratio is. A 30 × 40 mm box produces
+30 × 40 mm cells for a 3:4 photo, a 4:3 photo or a square one; six of them
+always measure exactly 6 × their width on the printed sheet.
 
-- If the image aspect matches the box (the expected case for a finished
-  carnet photo), the photo is drawn at exactly the configured size.
-- If not (e.g. a 3:4 image in a slightly wider box), the photo is
-  *shrunk* along the longer box dimension so nothing is stretched or
-  squashed. The drawn size is reported when the PDF is written.
-- `--fit-to-page` applies the same guarantee at page level: the whole
-  arrangement is scaled down uniformly and the final size is explained
-  in the output message.
+Inside its cell, the photograph is embedded at **its own aspect ratio**
+(the largest aspect-true fit, centred):
+
+- If the image aspect matches the cell (the expected case for a finished
+  carnet photo), the photo fills the cell completely.
+- If not (e.g. a square photo in a portrait cell), the photo is
+  letterboxed/pillarboxed on white — centred, never stretched, squashed
+  or cropped.
+- The whole arrangement fits the page: by default the GUI shrinks it
+  uniformly when the tweaked sizes do not fit (and says so in the status
+  line). The CLI errors instead unless `--fit-to-page` is passed.
+
+> Historical note: versions ≤ 1.1 shrank the *cell* to the image aspect
+> (a 4:3 photo got a smaller-than-configured box). That is why a modified
+> width could “miraculously” fit and why the minimum 4×3 cm came out
+> smaller for some photos. Since 1.2 the configured size is honoured
+> exactly.
 
 ---
 
 ## Validation
 
-Run the acceptance test suite (52 engine/CLI tests plus 28 GUI tests,
+Run the acceptance test suite (59 engine/CLI tests plus 55 GUI tests,
 stdlib `unittest` only; GUI tests skip automatically when tkinter or a
 display is unavailable):
 
@@ -290,7 +315,8 @@ content-stream operators, embedded image objects) to verify:
 2. Page is exactly US Letter: 612 × 792 pt.
 3. Default layout contains exactly six photo placements.
 4. All six placements reference the same embedded image.
-5. Each photo is drawn at the configured physical dimensions.
+5. Each photo cell is drawn at exactly the configured physical dimensions
+   (for every image aspect ratio).
 6. The photo's aspect ratio is preserved everywhere (default, contained,
    fit-to-page, EXIF-rotated inputs).
 7. All placements remain within the page boundaries.
@@ -304,6 +330,12 @@ content-stream operators, embedded image objects) to verify:
     quantity mismatches and unwritable outputs all produce clear errors
     (exit code 2), never a malformed PDF.
 12. The input files are byte-identical after generation.
+13. Tweaked size fields never make the GUI export fail: a layout that
+    overflows the page is shrunk uniformly (the status line explains the
+    resulting size), and an unparsable field falls back to the stock
+    settings with a note — never an error dialog.
+14. Cells keep the exact configured size for any image aspect; the image
+    content stays aspect-true inside its cell.
 
 A sample generated from `sample_photo.png` is included as
 `sample_photo_sheet.pdf`.
@@ -320,8 +352,12 @@ A sample generated from `sample_photo.png` is included as
   (612 × 792 pt), *not* the reference's non-standard 595.2 × 765.36 pt page.
 - A 3:4 photograph in the default box is drawn at 85.61 × 114.14 pt rather
   than 85.79 pt wide, because the default box's aspect (0.7514) is slightly
-  wider than 3:4 (0.75). Distortion is never introduced; pass a
-  `--photo-width 85.605` if you need that last 0.2 mm.
+  wider than 3:4 (0.75). Distortion is never introduced; pass a    `--photo-width 85.605` if you need that last 0.2 mm.
+- The drawn cell is always exactly the configured size; a photo whose
+  aspect differs from the cell is centred inside it on white (pillar-
+  or letterboxed). With the default 85.79 pt-wide box, a 3:4 photo shows
+  hairline white slivers on left/right (85.79 − 85.605 pt total); the
+  cutting borders still trace the cell, which keeps the grid exact.
 - Printer hardware margins are not modeled; the 30 pt default top/side
   margins leave headroom for typical laser printers, but very
   borderless-unfriendly printers may clip slightly more.

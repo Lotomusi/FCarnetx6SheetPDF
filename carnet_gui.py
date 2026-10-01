@@ -19,12 +19,15 @@ carnet_sheet.py and is shared with the command-line interface.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import replace
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -46,7 +49,7 @@ from carnet_sheet import (  # noqa: E402
 )
 
 APP_NAME = "Carnet Photo Sheet Maker"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Settings shown in the GUI. Units always display in millimetres; the
 # point-based defaults are converted for display and converted back on
@@ -74,14 +77,35 @@ DEFAULT_COPIES = 6
 COPIES_MIN = 1
 COPIES_MAX = 99
 
-# Bumped when the meaning of persisted settings changes. Version 2 is the
-# zero-gap release: settings saved by older versions (spacing 6/12 pt) are
-# not restored for spacing, so existing users get the new zero-gap defaults.
-SETTINGS_VERSION = 2
+# Bumped when the meaning of persisted settings changes. Version 3 is the
+# exact-cells release: "shrink to fit" is now the default, so settings saved
+# by older versions keep every stored value except "fit", which falls back
+# to the new on-by-default behaviour (older builds stored fit=False and
+# failed the export when tweaked sizes did not fit).
+SETTINGS_VERSION = 3
 
 
 def format_mm(key: str, value_mm: float) -> str:
     return f"{value_mm:.{MM_DECIMALS}f}"
+
+
+def parse_mm(raw: str) -> float:
+    """Parse a millimetre value, tolerating a comma decimal separator.
+
+    Raises ValueError for anything that is not a number (the caller turns
+    that into feedback, never into a crash).
+    """
+    return float(str(raw).strip().replace(",", "."))
+
+
+# One-click photo sizes. The first entry reproduces the stock geometry
+# (converted from the point defaults) so "default" is always recoverable.
+SIZE_PRESETS: list[tuple[str, float, float]] = [
+    ("Carnet 30×40 (default)", DEFAULTS_MM["photo_width"], DEFAULTS_MM["photo_height"]),
+    ("ID-2 35×45", 35.0, 45.0),
+    ("Passport 2×2 in (51×51)", 50.8, 50.8),
+]
+PRESET_CUSTOM = "Custom"
 
 
 IMAGE_FILETYPES = [
@@ -177,6 +201,7 @@ class CarnetSheetGUI:
         self.output_path: Path | None = None
         self._preview_job: str | None = None
         self._save_job: str | None = None
+        self._settings_note = ""
         self._thumb_cache: dict = {}
         self._thumb_refs: list = []
         self._results: queue.Queue = queue.Queue()
@@ -198,7 +223,11 @@ class CarnetSheetGUI:
         self.var_orientation = tk.StringVar(value="portrait")
         self.var_columns = tk.IntVar(value=6)
         self.var_border = tk.BooleanVar(value=True)
-        self.var_fit = tk.BooleanVar(value=False)
+        # On by default: tweaking the size fields must never block the
+        # export — an arrangement that does not fit is shrunk uniformly
+        # instead. Unchecking restores the old error-when-it-does-not-fit
+        # behaviour (the CLI's lack of --fit-to-page).
+        self.var_fit = tk.BooleanVar(value=True)
 
         self.var_photo_width = tk.StringVar(
             value=format_mm("photo_width", DEFAULTS_MM["photo_width"])
@@ -315,6 +344,17 @@ class CarnetSheetGUI:
             row=1, column=1, sticky="w", padx=(4, 16), pady=(6, 0)
         )
 
+        # --- Photo size presets -----------------------------------------
+        ttk.Label(box, text="Size preset:").grid(row=2, column=0, sticky="w")
+        self.var_preset = tk.StringVar(value=SIZE_PRESETS[0][0])
+        self.combo_preset = ttk.Combobox(
+            box, textvariable=self.var_preset,
+            values=[name for name, _w, _h in SIZE_PRESETS] + [PRESET_CUSTOM],
+            state="readonly", width=22,
+        )
+        self.combo_preset.grid(row=2, column=1, sticky="w", padx=(4, 16))
+        self.combo_preset.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
         size_fields = [
             ("Photo width (mm):", self.var_photo_width),
             ("Photo height (mm):", self.var_photo_height),
@@ -324,20 +364,47 @@ class CarnetSheetGUI:
             ("Left margin (mm):", self.var_left_margin),
             ("Right margin (mm):", self.var_right_margin),
         ]
-        for row, (label, variable) in enumerate(size_fields, start=2):
-            ttk.Label(box, text=label).grid(row=row, column=0, sticky="w")
-            ttk.Entry(box, textvariable=variable, width=10).grid(
-                row=row, column=1, sticky="w", padx=(4, 16)
+        self._size_entries: dict[str, ttk.Entry] = {}
+        # Validation feedback goes on the label (ttk.Entry does not accept
+        # highlight* options on Windows, and this must not crash there).
+        self._size_labels: dict[str, ttk.Label] = {}
+        for row, (label_text, variable) in enumerate(size_fields, start=3):
+            label = ttk.Label(box, text=label_text)
+            label.grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(box, textvariable=variable, width=10)
+            entry.grid(row=row, column=1, sticky="w", padx=(4, 16))
+            key = str(variable)
+            self._size_entries[key] = entry
+            self._size_labels[key] = label
+            # Enter confirms; Up/Down nudge the value (Shift = 0.1 mm).
+            entry.bind("<Return>", lambda e: self._on_size_edited())
+            entry.bind("<FocusOut>", lambda e: self._on_size_edited())
+            entry.bind("<Up>", lambda e, v=variable: self._nudge_size(v, +0.5))
+            entry.bind(
+                "<Shift-Up>", lambda e, v=variable: self._nudge_size(v, +0.1)
             )
+            entry.bind("<Down>", lambda e, v=variable: self._nudge_size(v, -0.5))
+            entry.bind(
+                "<Shift-Down>", lambda e, v=variable: self._nudge_size(v, -0.1)
+            )
+
+        # Live fit summary: whether the tweaked sizes fit the page and how
+        # many photos fit per sheet, refreshed with every settings change.
+        self.var_fit_summary = tk.StringVar(value="")
+        ttk.Label(
+            box, textvariable=self.var_fit_summary, font=("TkDefaultFont", 8),
+            foreground="#404040", wraplength=330, justify="left",
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         ttk.Checkbutton(
             box, text="Draw thin borders (cutting guides)",
             variable=self.var_border,
         ).grid(row=2, column=2, columnspan=2, sticky="w")
         ttk.Checkbutton(
-            box, text="Shrink to fit page instead of erroring",
+            box, text="Preview shrunk to fit (untick for exact sizes)",
             variable=self.var_fit,
         ).grid(row=3, column=2, columnspan=2, sticky="w")
+        # (Column 2 stays free on rows 4+: the size fields only use 0-1.)
 
         # --- Right column: live preview ---------------------------------
         preview_box = ttk.LabelFrame(top, text="Preview (page 1)", padding=6)
@@ -375,7 +442,12 @@ class CarnetSheetGUI:
         icon = load_icon()
         if icon is not None:
             self._icon_ref = icon  # keep a reference; Tk images are GC'd otherwise
-            self.root.iconphoto(True, icon)
+            try:
+                self.root.iconphoto(True, icon)
+            except tk.TclError:
+                # Cosmetic only — some environments (notably wine) reject
+                # the photo image here; the app must not die for an icon.
+                pass
 
     def _attach_traces(self) -> None:
         traced = [
@@ -388,6 +460,132 @@ class CarnetSheetGUI:
             var.trace_add("write", lambda *_: self._schedule_preview())
         self.var_columns.trace_add("write", lambda *_: self._schedule_preview())
         self.var_output.trace_add("write", lambda *_: self._save_settings_deferred())
+
+    # ------------------------------------------------------------------ #
+    # Size-field UX: presets, validation, live fit summary, nudging       #
+    # ------------------------------------------------------------------ #
+
+    def _on_preset_selected(self, _event=None) -> None:
+        """Apply the chosen photo-size preset to the width/height fields."""
+        selected = self.var_preset.get()
+        for name, width_mm, height_mm in SIZE_PRESETS:
+            if selected == name:
+                self.var_photo_width.set(format_mm("photo_width", width_mm))
+                self.var_photo_height.set(format_mm("photo_height", height_mm))
+                self._on_size_edited()
+                return
+        # PRESET_CUSTOM: nothing to apply; the fields keep their values.
+
+    def _nudge_size(self, variable: tk.StringVar, delta_mm: float) -> None:
+        """Arrow-key nudging: Up/Down ±0.5 mm, with Shift ±0.1 mm."""
+        try:
+            current = parse_mm(variable.get())
+        except ValueError:
+            return  # invalid input: the user must fix it first
+        variable.set(f"{max(0.0, current + delta_mm):.1f}")
+        self._on_size_edited()
+
+    def _on_size_edited(self) -> None:
+        """Refresh validation + summary right away and persist the edit."""
+        try:
+            self._refresh_field_validation()
+            self._update_fit_summary()
+            self._save_settings_deferred()
+        except tk.TclError:
+            pass  # the window is being torn down (FocusOut during destroy)
+
+    def _refresh_field_validation(self) -> None:
+        """Highlight invalid size fields in red; sync the preset picker."""
+        for variable in (
+            self.var_photo_width, self.var_photo_height,
+            self.var_spacing_x, self.var_spacing_y,
+            self.var_top_margin, self.var_left_margin, self.var_right_margin,
+        ):
+            label = self._size_labels.get(str(variable))
+            if label is None:
+                continue
+            try:
+                value = parse_mm(variable.get())
+            except ValueError:
+                valid = False
+            else:
+                # A photo cell of exactly zero is nonsense (and reachable
+                # via the arrow-key nudge, which clamps at 0); spacing and
+                # margins may legitimately be zero.
+                if variable in (self.var_photo_width, self.var_photo_height):
+                    valid = value > 0
+                else:
+                    valid = value >= 0
+            label.configure(foreground="#e02020" if not valid else "#404040")
+
+        # The preset picker follows the fields: selecting a preset shows
+        # its name, editing the numbers switches the label to "Custom".
+        try:
+            width_mm = parse_mm(self.var_photo_width.get())
+            height_mm = parse_mm(self.var_photo_height.get())
+        except ValueError:
+            matched = False
+        else:
+            matched = False
+            for name, preset_w, preset_h in SIZE_PRESETS:
+                if (
+                    # 1 µm tolerance: the 4-decimal mm display rounds the
+                    # stock size, so an exact float match never happens.
+                    math.isclose(width_mm, preset_w, rel_tol=0, abs_tol=1e-3)
+                    and math.isclose(height_mm, preset_h, rel_tol=0, abs_tol=1e-3)
+                ):
+                    if self.var_preset.get() != name:
+                        self.var_preset.set(name)
+                    matched = True
+                    break
+        if not matched and self.var_preset.get() != PRESET_CUSTOM:
+            self.var_preset.set(PRESET_CUSTOM)
+
+    def _update_fit_summary(self) -> None:
+        """Live one-liner: do the tweaked sizes fit, and what comes out."""
+        try:
+            config = self.build_config()
+        except (LayoutError, ValueError):
+            self.var_fit_summary.set("")
+            return
+        jobs = self._job_quantities()
+        if not jobs:
+            self.var_fit_summary.set("")
+            return
+        total = sum(copies for _path, copies in jobs)
+        # Cell geometry is aspect-independent, so a placeholder aspect is fine.
+        aspects = [[0.75] * copies for _path, copies in jobs]
+        try:
+            pages = placement_plan(aspects, config)
+        except LayoutError:
+            # Exact preview requested and the typed sizes overflow. The
+            # export itself always shrinks to fit, so say that.
+            self.var_fit_summary.set(
+                f"{total} photos at {pt_to_mm(config.photo_width):.1f} × "
+                f"{pt_to_mm(config.photo_height):.1f} mm each: too large for "
+                f"{config.paper} {config.orientation} — the export will "
+                "shrink them to fit."
+            )
+            return
+        first = pages[0].result
+        w_mm = pt_to_mm(first.photo_width)
+        h_mm = pt_to_mm(first.photo_height)
+        if first.scaled:
+            self.var_fit_summary.set(
+                f"{total} photos: too large for the page — the export will "
+                f"shrink them to {w_mm:.1f} × {h_mm:.1f} mm each."
+            )
+            return
+        if len(pages) > 1:
+            self.var_fit_summary.set(
+                f"{total} photos at {w_mm:.1f} × {h_mm:.1f} mm each: "
+                f"{len(pages[0].placements)} per page, {len(pages)} pages total."
+            )
+        else:
+            self.var_fit_summary.set(
+                f"{total} photos at {w_mm:.1f} × {h_mm:.1f} mm each: "
+                "fits on one page."
+            )
 
     # ------------------------------------------------------------------ #
     # Photo list management                                               #
@@ -476,6 +674,9 @@ class CarnetSheetGUI:
 
     def _schedule_preview(self) -> None:
         """Debounce redraws while the user types."""
+        # Keep the field highlighting, preset picker and fit summary in
+        # step with every settings change (debounced with the preview).
+        self._on_size_edited()
         if self._preview_job is not None:
             self.root.after_cancel(self._preview_job)
         self._preview_job = self.root.after(120, self.draw_preview)
@@ -540,7 +741,8 @@ class CarnetSheetGUI:
 
         Returns (pages, None) on success, (None, reason) when the job is
         empty or the photos cannot be read, and (None, LayoutError) when the
-        layout genuinely does not fit (fit-to-page disabled).
+        layout genuinely does not fit and exact-size preview is requested
+        ("shrink to fit" unchecked).
         """
         jobs = self._job_quantities()
         if not jobs:
@@ -556,8 +758,11 @@ class CarnetSheetGUI:
             aspects.append([aspect] * copies)
         if unreadable:
             return None, "unreadable"
+        plan_config = config
+        if self._preview_fit():
+            plan_config = replace(config, fit_to_page=True)
         try:
-            return placement_plan(aspects, config), None
+            return placement_plan(aspects, plan_config), None
         except LayoutError as exc:
             return None, exc
 
@@ -663,17 +868,21 @@ class CarnetSheetGUI:
         canvas = self.preview
         jobs = self._job_quantities()
         try:
-            # Box aspect is exact for the frames; heights use the box.
+            # Frames at the exact box aspect; generation-path behaviour so
+            # the fallback frames never explode on an overflowing tweak.
             box_aspect = config.photo_width / config.photo_height
             total = sum(copies for _path, copies in jobs) or 1
             aspects: list[list[float]] = [
                 [box_aspect] * copies for _path, copies in jobs
             ]
+            frame_config = config
+            if self._preview_fit():
+                frame_config = replace(config, fit_to_page=True)
             if total * config.photo_height > (792.0 - config.top_margin):
                 first_only = [aspects[0]]
-                pages = placement_plan(first_only, config)
+                pages = placement_plan(first_only, frame_config)
             else:
-                pages = placement_plan(aspects, config)
+                pages = placement_plan(aspects, frame_config)
         except Exception:
             self._draw_page_outline(config)
             return
@@ -747,8 +956,18 @@ class CarnetSheetGUI:
         # Tk Variables (and even event_generate) must never be touched from
         # a worker thread — on Windows those calls raise
         # "main thread is not in main loop".
+        #
+        # A tweaked size field that cannot be parsed (blank, non-numeric)
+        # must not block the export either: fall back to the stock settings
+        # and say so on the status line. The "shrink to fit" default
+        # already keeps valid-but-overflowing tweaks from failing.
+        self._settings_note = ""
         try:
-            config = self.build_config()
+            config = replace(self.build_config(), fit_to_page=True)
+        except (LayoutError, ValueError) as exc:
+            config = LayoutConfig(fit_to_page=True)
+            self._settings_note = f" (ignored invalid settings: {exc})"
+        try:
             jobs = self._job_quantities()
             if not jobs:
                 raise LayoutError(
@@ -829,6 +1048,7 @@ class CarnetSheetGUI:
             f"PDF written: {summary['output']} — "
             f"page {pw:.0f} × {ph:.0f} pt, {summary['placements']} photos of "
             f"{pt_to_mm(w):.1f} × {pt_to_mm(h):.1f} mm{pages_note}{note}"
+            f"{self._settings_note}"
         )
         if messagebox.askyesno(
             "PDF ready",
@@ -876,12 +1096,13 @@ class CarnetSheetGUI:
             value = saved.get("columns")
             if isinstance(value, int) and 1 <= value <= 99:
                 self.var_columns.set(value)
-            for key, var in (
-                ("border", self.var_border),
-                ("fit", self.var_fit),
-            ):
+            for key, var in (("border", self.var_border),):
                 if isinstance(saved.get(key), bool):
                     var.set(saved[key])
+            # "fit" is not persisted: shrink-to-fit is always on for
+            # generation (the checkbox only governs the preview), so a
+            # restored False from an older version must never re-break
+            # tweaked-size exports.
             migrated = saved.get("settings_version") != SETTINGS_VERSION
             for key, var in (
                 ("photo_width", self.var_photo_width),
@@ -914,8 +1135,23 @@ class CarnetSheetGUI:
                     self.add_photo(Path(path), copies)
         except Exception:
             pass  # corrupt or partially valid settings: keep defaults
+        self._refresh_field_validation()
+        self._update_fit_summary()
         self._rebuild_photo_rows()
         self.draw_preview()
+
+    def _preview_fit(self) -> bool:
+        """Whether the live preview should shrink overflowing layouts.
+
+        On by default, mirroring generation: an overflowing tweak shows the
+        uniform shrink instead of a red "does not fit" page. Unchecking
+        "Shrink to fit page instead of erroring" restores the exact
+        (possibly overflowing) preview with the warning text.
+        """
+        try:
+            return bool(self.var_fit.get())
+        except (tk.TclError, ValueError):
+            return True
 
     def save_settings(self) -> None:
         data: dict = {}
@@ -928,7 +1164,6 @@ class CarnetSheetGUI:
                 orientation=self.var_orientation.get(),
                 columns=int(self.var_columns.get()),
                 border=bool(self.var_border.get()),
-                fit=bool(self.var_fit.get()),
             )
             for key, var in (
                 ("photo_width", self.var_photo_width),
@@ -939,7 +1174,7 @@ class CarnetSheetGUI:
                 ("left_margin", self.var_left_margin),
                 ("right_margin", self.var_right_margin),
             ):
-                data[key] = float(var.get())
+                data[key] = parse_mm(var.get())
             data["photos"] = [
                 {"path": str(entry["path"]), "copies": int(entry["copies"].get())}
                 for entry in self.photos
@@ -958,7 +1193,14 @@ class CarnetSheetGUI:
     # ------------------------------------------------------------------ #
 
     def build_config(self) -> LayoutConfig:
-        """Translate the form into a LayoutConfig (mm entries → points)."""
+        """Translate the form into a LayoutConfig (mm entries → points).
+
+        ``fit_to_page`` mirrors the "shrink to fit" checkbox, which now
+        defaults to on: the live preview shows the shrunk arrangement
+        instead of a warning when a tweak overflows the page. Generation
+        additionally forces this on (see on_generate), so tweaked sizes
+        can never make the export fail.
+        """
         try:
             columns = int(self.var_columns.get())
         except (tk.TclError, ValueError):
@@ -967,25 +1209,32 @@ class CarnetSheetGUI:
         def mm_entry(var: tk.StringVar, name: str) -> float:
             raw = var.get().strip()
             try:
-                value = float(raw)
+                value = parse_mm(raw)
             except ValueError:
                 raise LayoutError(f"{name} must be a number (got {raw!r}).") from None
             return mm_to_pt(value)
+
+        width_pt = mm_entry(self.var_photo_width, "Photo width")
+        height_pt = mm_entry(self.var_photo_height, "Photo height")
+        if width_pt <= 0 or height_pt <= 0:
+            raise LayoutError(
+                "Photo width and height must be greater than zero."
+            )
 
         return LayoutConfig(
             paper=self.var_paper.get(),
             orientation=self.var_orientation.get(),
             copies=0,  # unused by the GUI: quantities come from the photo list
             columns=columns,
-            photo_width=mm_entry(self.var_photo_width, "Photo width"),
-            photo_height=mm_entry(self.var_photo_height, "Photo height"),
+            photo_width=width_pt,
+            photo_height=height_pt,
             spacing_x=mm_entry(self.var_spacing_x, "Horizontal spacing"),
             spacing_y=mm_entry(self.var_spacing_y, "Vertical spacing"),
             top_margin=mm_entry(self.var_top_margin, "Top margin"),
             left_margin=mm_entry(self.var_left_margin, "Left margin"),
             right_margin=mm_entry(self.var_right_margin, "Right margin"),
             border=self.var_border.get(),
-            fit_to_page=self.var_fit.get(),
+            fit_to_page=self._preview_fit(),
         )
 
 

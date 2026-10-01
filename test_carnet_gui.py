@@ -110,11 +110,149 @@ class TestCarnetGUI(unittest.TestCase):
         self.assertEqual(config.orientation, "portrait")
         self.assertEqual(config.columns, 6)
         self.assertTrue(config.border)
-        self.assertFalse(config.fit_to_page)
+        # The generation config can always shrink to fit: a tweaked size
+        # must never make the export fail (regression: GUI error dialog).
+        self.assertTrue(config.fit_to_page)
         # mm defaults convert back to the same point values as the CLI.
         self.assertAlmostEqual(config.photo_width, 85.79, places=2)
         self.assertAlmostEqual(config.photo_height, 114.14, places=2)
         self.assertAlmostEqual(config.top_margin, 30.0, places=2)
+
+    def test_shrink_to_fit_checkbox_defaults_to_on(self) -> None:
+        # New default: tweaking the size fields never blocks the export.
+        self.assertTrue(self.gui.var_fit.get())
+
+    # ------------------------------------------------------------------ #
+    # Size-field UX: presets, validation, fit summary, nudging            #
+    # ------------------------------------------------------------------ #
+
+    def test_preset_picker_applies_sizes(self) -> None:
+        self.gui.var_preset.set("ID-2 35×45")
+        self.gui._on_preset_selected()
+        self.assertEqual(self.gui.var_photo_width.get(), "35.0000")
+        self.assertEqual(self.gui.var_photo_height.get(), "45.0000")
+        config = self.gui.build_config()
+        self.assertAlmostEqual(config.photo_width, 35 / 25.4 * 72, places=3)
+
+    def test_preset_picker_returns_to_stock_default(self) -> None:
+        self.gui.var_preset.set("ID-2 35×45")
+        self.gui._on_preset_selected()
+        self.gui.var_preset.set("Carnet 30×40 (default)")
+        self.gui._on_preset_selected()
+        config = self.gui.build_config()
+        self.assertAlmostEqual(config.photo_width, 85.79, places=3)
+        self.assertAlmostEqual(config.photo_height, 114.14, places=3)
+
+    def test_editing_sizes_marks_preset_custom(self) -> None:
+        self.gui._refresh_field_validation()  # starts matched to the default
+        self.assertEqual(self.gui.var_preset.get(), "Carnet 30×40 (default)")
+        self.gui.var_photo_width.set("36.0000")
+        self.gui._refresh_field_validation()
+        self.assertEqual(self.gui.var_preset.get(), "Custom")
+
+    def test_invalid_field_turns_red(self) -> None:
+        label = self.gui._size_labels[str(self.gui.var_photo_width)]
+        self.gui.var_photo_width.set("35")
+        self.gui._refresh_field_validation()
+        self.assertEqual(str(label.cget("foreground")), "#404040")
+        self.gui.var_photo_width.set("35 mm")  # not a number
+        self.gui._refresh_field_validation()
+        self.assertEqual(str(label.cget("foreground")), "#e02020")
+
+    def test_zero_photo_size_turns_red_but_zero_spacing_is_fine(self) -> None:
+        # A 0 mm photo is nonsense (the arrow-key nudge clamps at 0, so a
+        # user can land there); zero spacing/margins are legitimate.
+        width_label = self.gui._size_labels[str(self.gui.var_photo_width)]
+        spacing_label = self.gui._size_labels[str(self.gui.var_spacing_x)]
+        self.gui.var_photo_width.set("0")
+        self.gui.var_spacing_x.set("0")
+        self.gui._refresh_field_validation()
+        self.assertEqual(str(width_label.cget("foreground")), "#e02020")
+        self.assertEqual(str(spacing_label.cget("foreground")), "#404040")
+
+    def test_zero_photo_size_rejected_by_build_config(self) -> None:
+        # Exporting with a zero photo size must take the same
+        # "ignored invalid settings" fallback as any other typo.
+        self.gui.var_photo_height.set("0")
+        with self.assertRaises(carnet_sheet.LayoutError):
+            self.gui.build_config()
+
+    def test_fit_summary_survives_zero_photo_size(self) -> None:
+        # Regression: a 0 mm height used to crash the preview's background
+        # callback with ZeroDivisionError (float floor division by zero).
+        self.gui.add_photo(self.photo)
+        self.gui.var_photo_height.set("0")
+        self.gui._update_fit_summary()  # must not raise
+        self.assertEqual(self.gui.var_fit_summary.get(), "")
+
+    def test_comma_decimal_separator_is_accepted(self) -> None:
+        # Spanish keyboards: "35,5" must parse as 35.5.
+        self.gui.var_photo_width.set("35,5")
+        config = self.gui.build_config()
+        self.assertAlmostEqual(config.photo_width, 35.5 / 25.4 * 72, places=3)
+
+    def test_fit_summary_reports_single_page(self) -> None:
+        self.gui.add_photo(self.photo)
+        self.gui._update_fit_summary()
+        text = self.gui.var_fit_summary.get()
+        self.assertIn("6 photos", text)
+        self.assertIn("fits on one page", text)
+        self.assertIn("30.3 × 40.3", text)
+
+    def test_fit_summary_reports_overflow_and_shrink(self) -> None:
+        self.gui.add_photo(self.photo)
+        self.gui.var_photo_width.set("40.0000")
+        self.gui.var_photo_height.set("53.3070")
+        self.gui._update_fit_summary()
+        text = self.gui.var_fit_summary.get()
+        self.assertIn("too large", text)
+        self.assertIn("shrink", text)
+
+    def test_fit_summary_reports_multipage(self) -> None:
+        self.gui.add_photo(self.photo, 40)  # 36 fit per page
+        self.gui._update_fit_summary()
+        text = self.gui.var_fit_summary.get()
+        self.assertIn("40 photos", text)
+        self.assertIn("2 pages", text)
+        self.assertIn("36 per page", text)
+
+    def test_fit_summary_empty_without_photos(self) -> None:
+        self.gui._update_fit_summary()
+        self.assertEqual(self.gui.var_fit_summary.get(), "")
+
+    def test_arrow_keys_nudge_size_field(self) -> None:
+        # Invoke the handler directly: synthetic <Up> events are not
+        # delivered under wine/CI, so this tests the nudge math.
+        var = self.gui.var_photo_width
+        var.set("35.0000")
+        self.gui._nudge_size(var, +0.5)
+        self.assertEqual(var.get(), "35.5")
+        self.gui._nudge_size(var, +0.1)
+        self.assertEqual(var.get(), "35.6")
+        self.gui._nudge_size(var, -0.5)
+        self.assertEqual(var.get(), "35.1")
+        self.gui._nudge_size(var, -0.1)
+        self.assertEqual(var.get(), "35.0")
+
+    def test_nudge_never_goes_negative(self) -> None:
+        var = self.gui.var_spacing_x
+        var.set("0.0000")
+        self.gui._nudge_size(var, -0.5)
+        self.assertEqual(var.get(), "0.0")
+
+    def test_nudge_ignores_invalid_field(self) -> None:
+        var = self.gui.var_photo_width
+        var.set("35 mm")
+        self.gui._nudge_size(var, +0.5)  # must not raise, must not change
+        self.assertEqual(var.get(), "35 mm")
+
+    def test_size_entries_have_nudge_bindings(self) -> None:
+        # The key bindings stay wired even though the tests drive the
+        # handler directly (wine does not deliver synthetic key events).
+        # Tk reports <Up> as <Key-Up> in the binding list.
+        entry = self.gui._size_entries[str(self.gui.var_photo_width)]
+        self.assertIn("<Key-Up>", entry.bind())
+        self.assertIn("<Shift-Key-Up>", entry.bind())
 
     def test_invalid_number_raises_actionable_layout_error(self) -> None:
         self.gui.var_photo_width.set("abc")
@@ -331,9 +469,11 @@ class TestCarnetGUI(unittest.TestCase):
 
     def test_preview_label_cleared_when_layout_does_not_fit(self) -> None:
         self.gui.add_photo(self.photo)
+        # With shrink-to-fit unchecked, an overflowing tweak shows the
+        # exact (overflowing) geometry and the "layout does not fit" note.
+        self.gui.var_fit.set(False)
         # A 300 mm photo box is taller than the space below the top margin,
-        # so no row can fit; fit-to-page is off. (A too-wide box alone would
-        # not overflow: the 3:4 image is contained inside it.)
+        # so no row can fit. (A too-wide box alone would not overflow.)
         self.gui.var_photo_width.set("40.0000")
         self.gui.var_photo_height.set("300.0000")
         self.gui.draw_preview()
@@ -344,6 +484,28 @@ class TestCarnetGUI(unittest.TestCase):
             if self.gui.preview.type(item) == "text"
         ]
         self.assertIn("layout does not fit", texts)
+
+    def test_preview_shrinks_overflowing_tweak_by_default(self) -> None:
+        # Default (shrink-to-fit on): the same overflowing tweak previews
+        # the shrunk arrangement instead of warning.
+        self.gui.add_photo(self.photo)
+        self.gui.var_photo_width.set("40.0000")
+        self.gui.var_photo_height.set("300.0000")
+        self.gui.draw_preview()
+        self.assertEqual(self.gui.preview_pages.get(), "6 photos")
+        texts = [
+            self.gui.preview.itemcget(item, "text")
+            for item in self.gui.preview.find_all()
+            if self.gui.preview.type(item) == "text"
+        ]
+        self.assertNotIn("layout does not fit", texts)
+        rects = [
+            item
+            for item in self.gui.preview.find_all()
+            if self.gui.preview.type(item) == "rectangle"
+        ]
+        # Page rectangle + 6 shrunk photo rectangles.
+        self.assertEqual(len(rects), 7)
 
     def test_preview_label_cleared_for_unreadable_photo(self) -> None:
         bad = self.tmp / "bad2.png"
@@ -420,6 +582,23 @@ class TestCarnetGUI(unittest.TestCase):
             [str(self.photo), str(self.photo_b)],
         )
 
+    def test_older_settings_do_not_disable_shrink_to_fit(self) -> None:
+        """An old stored fit=False must not re-break tweaked-size exports."""
+        import carnet_gui
+
+        self.store.save(
+            {
+                "settings_version": 2,
+                "fit": False,
+                "photo_width": 30.26,
+                "photo_height": 40.26,
+            }
+        )
+        gui2 = carnet_gui.CarnetSheetGUI(self.root, store=self.store)
+        self.assertTrue(gui2.var_fit.get())
+        # ...and the generation config stays shrink-safe.
+        self.assertTrue(gui2.build_config().fit_to_page)
+
     def test_pre_zero_gap_settings_get_zero_gap_defaults(self) -> None:
         """Settings saved by the old (spaced) version must not pin old gaps."""
         import carnet_gui
@@ -444,6 +623,57 @@ class TestCarnetGUI(unittest.TestCase):
         self.assertAlmostEqual(float(gui2.var_spacing_y.get()), 0.0, places=6)
         self.assertAlmostEqual(float(gui2.var_top_margin.get()), 10.58, places=3)
         self.assertAlmostEqual(float(gui2.var_photo_width.get()), 30.26, places=3)
+
+    def test_generation_survives_overflowing_size_tweak(self) -> None:
+        """Problem-1 regression: a tweaked 40x53 mm box must still export.
+
+        Six 40 mm-wide photos do not fit between letter margins; the GUI
+        must shrink the sheet (like --fit-to-page) instead of failing.
+        """
+        import tkinter.messagebox as messagebox
+
+        shown = {}
+        messagebox.askyesno = lambda *a, **k: False
+        messagebox.showerror = lambda title, msg, **k: shown.update(
+            title=title, msg=msg
+        )
+        self.gui.add_photo(self.photo)
+        self.gui.var_photo_width.set("40.0000")
+        self.gui.var_photo_height.set("53.3070")
+        self.gui.output_path = self.tmp / "tweaked.pdf"
+        self.gui.on_generate()
+        self.assertFalse(
+            shown, f"unexpected error dialog: {shown.get('msg')}"
+        )
+        self._wait_generation_done()
+        out = self.gui.output_path
+        self.assertTrue(out.exists())
+        self.assertEqual(out.read_bytes()[:5], b"%PDF-")
+        self.assertIn("PDF written", self.gui.status.get())
+        self.assertIn("shrunk to fit", self.gui.status.get())
+
+    def test_generation_ignores_invalid_field_instead_of_erroring(
+        self,
+    ) -> None:
+        """A blank/garbage field falls back to stock settings, not a dialog."""
+        import tkinter.messagebox as messagebox
+
+        shown = {}
+        messagebox.askyesno = lambda *a, **k: False
+        messagebox.showerror = lambda title, msg, **k: shown.update(
+            title=title, msg=msg
+        )
+        self.gui.add_photo(self.photo)
+        self.gui.var_photo_width.set("35 mm")  # not parseable as a number
+        self.gui.output_path = self.tmp / "fallback.pdf"
+        self.gui.on_generate()
+        self.assertFalse(shown, f"unexpected error dialog: {shown.get('msg')}")
+        self._wait_generation_done()
+        out = self.gui.output_path
+        self.assertTrue(out.exists())
+        self.assertEqual(out.read_bytes()[:5], b"%PDF-")
+        # The fallback is reported on the status line.
+        self.assertIn("ignored invalid settings", self.gui.status.get())
 
     def test_store_survives_corrupt_file(self) -> None:
         import carnet_gui

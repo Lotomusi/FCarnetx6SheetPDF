@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # --------------------------------------------------------------------------- #
 # Physical units                                                              #
@@ -69,11 +69,13 @@ DEFAULT_SPACING_Y = 0.0
 class LayoutConfig:
     """All tunable layout parameters, with defaults matching the reference.
 
-    photo_width/photo_height describe the target box for one photograph.
-    The image is always drawn at its own aspect ratio, contained inside that
-    box, so it is never stretched or squashed.
+    photo_width/photo_height describe the exact cell size for one
+    photograph. Every cell is laid out at exactly this size and the image is
+    embedded inside it at its own aspect ratio (centred), so nothing is ever
+    stretched or squashed and the configured dimensions are honoured
+    whatever the photo's aspect ratio is.
 
-    Copies are packed with zero intentional spacing between adjacent photos
+    Copies are packed with zero intentional spacing between adjacent cells
     (spacing_x/spacing_y default to 0). They remain configurable (and
     non-negative) so existing scripts keep working, but the defaults now
     produce a true 0-gap layout.
@@ -150,7 +152,7 @@ class LayoutResult:
 
     page_width: float
     page_height: float
-    photo_width: float  # actual drawn size (image aspect, inside the box)
+    photo_width: float  # cell size used (the configured box, possibly shrunk)
     photo_height: float
     x0: float  # left edge of the content strip
     y_top: float  # top edge of the content strip (PDF coords, origin bottom-left)
@@ -182,13 +184,17 @@ def _row_col(index: int, columns: int) -> tuple[int, int]:
     return index // columns, index % columns
 
 
-def compute_layout(config: LayoutConfig, image_aspect: float) -> LayoutResult:
-    """Resolve the full page geometry, preserving the image's aspect ratio.
+def compute_layout(
+    config: LayoutConfig, image_aspect: float | None = None
+) -> LayoutResult:
+    """Resolve the full page geometry for a single-image page.
 
-    The photo is drawn at the largest size that (a) keeps the image's own
-    aspect ratio and (b) fits inside the configured photo box. When the image
-    aspect equals the box aspect (the expected case for a finished carnet
-    photo), the drawn size is exactly the configured size.
+    Every photo cell is exactly ``config.photo_width`` ×
+    ``config.photo_height``; the image is embedded inside its cell at its
+    own aspect ratio, so the configured cell size is honoured whatever the
+    photo's aspect ratio is (nothing is stretched or squashed).
+
+    ``image_aspect`` is accepted for backward compatibility and ignored.
 
     Raises LayoutError if the arrangement does not fit the page and
     fit-to-page is disabled.
@@ -198,14 +204,8 @@ def compute_layout(config: LayoutConfig, image_aspect: float) -> LayoutResult:
     page_w, page_h = config.paper_dimensions()
     rows = config.rows()
 
-    # --- Drawn photo size: contain the image inside the configured box. -----
-    by_width = (config.photo_width, config.photo_width / image_aspect)
-    by_height = (config.photo_height * image_aspect, config.photo_height)
-    # Choose the containment that uses the most area without exceeding the box.
-    if by_width[1] <= config.photo_height + 1e-9:
-        draw_w, draw_h = by_width
-    else:
-        draw_w, draw_h = by_height
+    # --- Cell size: exactly as configured (image fits inside, aspect-true) ---
+    draw_w, draw_h = config.photo_width, config.photo_height
 
     scale = 1.0
 
@@ -236,7 +236,8 @@ def compute_layout(config: LayoutConfig, image_aspect: float) -> LayoutResult:
                 f"on {config.paper} {config.orientation}. Reduce the photo "
                 "height/spacing or the number of rows, or use --fit-to-page."
             )
-        # Fit to page: shrink uniformly, preserving the image aspect ratio.
+        # Fit to page: shrink the whole arrangement uniformly (cells keep
+        # their square corners; images stay aspect-true inside their cells).
         s = min(
             avail_w / cw,
             avail_h / ch,
@@ -286,35 +287,34 @@ def placement_rects(
 # --------------------------------------------------------------------------- #
 
 
-def _drawn_size(
-    box_width: float, box_height: float, aspect: float
-) -> tuple[float, float]:
-    """Largest (w, h) with the given aspect that fits the box (containment)."""
-    by_width = (box_width, box_width / aspect)
-    by_height = (box_height * aspect, box_height)
-    if by_width[1] <= box_height + 1e-9:
-        return by_width
-    return by_height
-
-
 def placement_plan(
     job_aspects: Sequence[Sequence[float]], config: LayoutConfig
 ) -> list[PageLayout]:
     """Plan every page needed for a multi-image job.
 
-    ``job_aspects`` holds the aspects of each source image's requested
-    placements, in sequential order. The packing is sequential/row-major:
-    finish the requested copies of the first image, then continue with the
-    next image, wrapping onto additional pages with the same layout rules
-    when the current page's columns × rows grid is full.
+    ``job_aspects`` holds one entry per source image, each a sequence with
+    one element per requested copy (the per-image aspect values are kept for
+    backward compatibility but no longer influence the cell geometry: every
+    cell is exactly the configured photo box, and each image is embedded
+    inside its cell at its own aspect ratio).
+
+    The packing is sequential/row-major: finish the requested copies of the
+    first image, then continue with the next image, wrapping onto additional
+    pages with the same layout rules when the current page's columns × rows
+    grid is full.
     """
     if not job_aspects:
         raise LayoutError("No photographs were requested.")
+    # Zero/negative cell sizes are nonsense input (reachable in the GUI by
+    # nudging a size down to 0). Raise the standard error instead of letting
+    # the floor division below crash with ZeroDivisionError.
+    if config.photo_width <= 0 or config.photo_height <= 0:
+        raise LayoutError("Photo width and height must be positive numbers.")
 
     page_w, page_h = config.paper_dimensions()
     avail_h = page_h - config.top_margin
-    # Rows that physically fit below the top margin (drawn heights never
-    # exceed the configured box height, so this never overfills a page).
+    # Rows that physically fit below the top margin (cell heights are exactly
+    # the configured photo height, so this never overfills a page).
     rows_that_fit = int(avail_h // config.photo_height)
     if rows_that_fit < 1:
         if not config.fit_to_page:
@@ -360,21 +360,21 @@ def _plan_page(
     config: LayoutConfig,
     job_indices: Sequence[int] | None = None,
 ) -> tuple[LayoutResult, list[Placement]]:
-    """Lay out one page of photo aspects, row-major, with zero gaps.
+    """Lay out one page of photo cells, row-major, with zero gaps.
 
-    Every photo keeps its own aspect ratio inside the configured photo box;
-    each row's height is driven by the tallest drawn photo in that row and
-    the page width by the widest row. Raises LayoutError if the page does
+    Every cell is exactly ``config.photo_width`` × ``config.photo_height``;
+    each image is embedded inside its cell at its own aspect ratio (centred,
+    never stretched) by the PDF writer. Raises LayoutError if the page does
     not fit and fit-to-page is disabled (same rules as compute_layout).
 
-    ``job_indices`` maps each aspect back to its source image; it defaults
-    to the identity when a caller only cares about geometry.
+    ``job_indices`` maps each cell back to its source image; it defaults to
+    the identity when a caller only cares about geometry.
     """
     if not aspects:
         raise LayoutError("No photographs were requested.")
     if job_indices is None:
         job_indices = range(len(aspects))
-    drawn = [_drawn_size(config.photo_width, config.photo_height, a) for a in aspects]
+    drawn = [(config.photo_width, config.photo_height)] * len(aspects)
     rows_count = math.ceil(len(drawn) / config.columns)
 
     scale = 1.0
@@ -412,7 +412,8 @@ def _plan_page(
                 f"on {config.paper} {config.orientation}. Reduce the photo "
                 "height/spacing or the number of rows, or use --fit-to-page."
             )
-        # Fit to page: shrink uniformly, preserving each image's aspect ratio.
+        # Fit to page: shrink the whole arrangement uniformly (cells keep
+        # their size ratio; images stay aspect-true inside their cells).
         scale = min(avail_w / cw, avail_h / ch)
         drawn = [(w * scale, h * scale) for w, h in drawn]
         cw, ch, row_heights, _row_widths = measure()
@@ -478,7 +479,7 @@ def load_source_image(path: Path) -> SourceImage:
     """Open and inspect the image without modifying it.
 
     Returns the pixel size after applying EXIF orientation in-memory, which
-    is the orientation-aware aspect ratio used for layout calculations.
+    is the orientation-aware aspect ratio used for thumbnails and reporting.
     """
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
@@ -493,7 +494,20 @@ def load_source_image(path: Path) -> SourceImage:
             oriented = ImageOps.exif_transpose(im)
     except FileNotFoundError:
         raise
+    except UnidentifiedImageError as exc:
+        raise ValueError(
+            f"Could not identify image file {path.name}. Make sure the file "
+            "is a valid JPEG, PNG or WebP photograph."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            f"Could not open {path.name} as an image ({exc.__class__.__name__}: "
+            f"{exc}). Make sure the file is a valid JPEG, PNG or WebP "
+            "photograph."
+        ) from exc
     except Exception as exc:
+        # Pillow raises a zoo of exception types for damaged files; wrap
+        # everything unexpected so callers only ever see a clean ValueError.
         raise ValueError(
             f"Could not open {path.name} as an image ({exc.__class__.__name__}: "
             f"{exc}). Make sure the file is a valid JPEG, PNG or WebP "
@@ -525,8 +539,13 @@ def generate_pdf(
     """Generate the sheet PDF. Returns a summary dict describing the output.
 
     Single-image mode (semantics unchanged): one ``image_path`` and no
-    ``quantities`` produces ``config.copies`` placements — now with the
+    ``quantities`` produces ``config.copies`` placements — with the
     zero-gap defaults, so adjacent photos touch.
+
+    Every photo cell is exactly ``config.photo_width`` ×
+    ``config.photo_height`` (or uniformly shrunk when fit-to-page kicks
+    in); each image is embedded inside its cell at its own aspect ratio,
+    centred, never stretched or squashed.
 
     Multi-image mode: pass a list of image paths and a matching
     ``quantities`` list (same length). The requested placements are packed
@@ -562,7 +581,7 @@ def generate_pdf(
     # --- Plan the pages ------------------------------------------------------
     if quantities is None:
         # Single-image mode: classic one-page layout, semantics unchanged.
-        layout = compute_layout(config, sources[0].aspect)
+        layout = compute_layout(config)  # cell geometry is aspect-independent
         rects = placement_rects(layout, config)
         pages: list[PageLayout] = [
             PageLayout(
@@ -617,13 +636,19 @@ def generate_pdf(
                     reader = ImageReader(embeds[placement.job_index])
                 else:
                     reader = ImageReader(str(paths[placement.job_index]))
+                # The cell is exactly the configured size; the image is
+                # embedded inside it at its own aspect ratio (largest
+                # aspect-true fit, centred). Carnet photos usually match the
+                # cell aspect and fill it completely; anything else is
+                # letterboxed/pillarboxed on white without distortion.
                 c.drawImage(
                     reader,
                     placement.x,
                     placement.y,
                     width=placement.width,
                     height=placement.height,
-                    preserveAspectRatio=False,  # box already matches image aspect
+                    preserveAspectRatio=True,
+                    anchor="c",
                     mask=None,
                 )
                 if config.border:

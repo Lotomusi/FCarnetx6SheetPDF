@@ -366,6 +366,17 @@ class TestErrors(BaseTestCase):
         with self.assertRaises(carnet_sheet.LayoutError):
             self.generate(top_margin=-5)
 
+    def test_placement_plan_rejects_zero_photo_size(self) -> None:
+        # Zero cell sizes are nonsense input (reachable in the GUI by
+        # nudging a size down to 0, which clamps at 0). placement_plan
+        # must raise the standard LayoutError instead of crashing with
+        # ZeroDivisionError inside the preview's background callback.
+        for kwargs in ({"photo_width": 0.0}, {"photo_height": 0.0}):
+            with self.subTest(**kwargs):
+                config = carnet_sheet.LayoutConfig(**kwargs)
+                with self.assertRaises(carnet_sheet.LayoutError):
+                    carnet_sheet.placement_plan([[0.75] * 6], config)
+
     def test_fit_to_page_shrinks_preserving_aspect(self) -> None:
         out = self.tmp / "fit.pdf"
         summary = self.generate(
@@ -454,10 +465,22 @@ class TestZeroGapSpacing(BaseTestCase):
         self.assertEqual(rc, 0)
         ops = _image_draw_operations(_page_content(out.read_bytes()))
         self.assertEqual(len(ops), 6)
+        # The image content inside each cell is aspect-true; a 3:4 image in
+        # the (slightly wider) reference box is inset by a hair on each
+        # side, and neighbours still touch cell-edge to cell-edge.
+        cell = 85.79
+        drawn_inset = (cell - ops[0][2]) / 2.0
         ops_sorted = sorted(ops, key=lambda op: op[0])
         for left, right in zip(ops_sorted, ops_sorted[1:]):
             gap = right[0] - (left[0] + left[2])
-            self.assertAlmostEqual(gap, 0.0, places=4)
+            self.assertAlmostEqual(gap, 2 * drawn_inset, places=4)
+        # ...and the cells themselves still sit at an exact zero gap.
+        for i, (left, right) in enumerate(zip(ops_sorted, ops_sorted[1:])):
+            self.assertAlmostEqual(
+                right[0] - drawn_inset - (left[0] - drawn_inset) - cell,
+                0.0, places=4,
+                msg=f"cell gap at index {i} is not zero",
+            )
 
     def test_explicit_spacing_is_still_honoured(self) -> None:
         config = carnet_sheet.LayoutConfig(spacing_x=6.0)
@@ -592,13 +615,115 @@ class TestMultiImage(BaseTestCase):
             _image_draw_operations(content), key=lambda op: (op[1], op[0])
         )
         self.assertEqual(len(ops), 12)
-        # Same-row neighbours touch (rows share y within tolerance).
+        # Same-row neighbours touch (rows share y within tolerance). The
+        # image content is aspect-true inside each cell, so a 3:4 image in
+        # the wider reference box leaves a symmetrical sliver on each side:
+        # cell-edge gaps stay 0 while content gaps equal the two insets.
+        drawn_inset = (85.79 - ops[0][2]) / 2.0
         for left, right in zip(ops, ops[1:]):
             same_row = abs(left[1] - right[1]) < 1e-4
             if same_row:
                 gap = right[0] - (left[0] + left[2])
-                self.assertAlmostEqual(gap, 0.0, places=4)
+                self.assertAlmostEqual(gap, 2 * drawn_inset, places=4)
         self.assertGreaterEqual(len(_rect_stroke_operations(content)), 12)
+
+
+class TestExactCellSizing(BaseTestCase):
+    """Problem-2 regression: the configured size is honoured for any image.
+
+    Every cell must measure exactly photo_width x photo_height whatever the
+    image's aspect ratio is; the image itself is embedded aspect-true inside
+    the cell (letterboxed/pillarboxed on white, never distorted).
+    """
+
+    def test_default_box_is_exact_for_every_aspect(self) -> None:
+        aspects = {
+            "3:4": 3 / 4,
+            "4:3": 4 / 3,
+            "1:1": 1.0,
+            "2:3": 2 / 3,
+            "passport-cam (1000x1299)": 1000 / 1299,
+        }
+        for name, aspect in aspects.items():
+            with self.subTest(image=name):
+                config = carnet_sheet.LayoutConfig()
+                layout = carnet_sheet.compute_layout(config, aspect)
+                self.assertAlmostEqual(layout.photo_width, 85.79, places=6)
+                self.assertAlmostEqual(layout.photo_height, 114.14, places=6)
+
+    def test_tweaked_sizes_keep_exact_six_by_width_math(self) -> None:
+        # A user widening the box to 35 mm must get exactly 35 mm cells:
+        # with 5 columns the strip is 5 x 35 mm (previously the engine
+        # silently shrank the cells to 33.75 mm for a 3:4 image).
+        config = carnet_sheet.LayoutConfig(
+            photo_width=carnet_sheet.mm_to_pt(35),
+            photo_height=carnet_sheet.mm_to_pt(45),
+            columns=5,
+            copies=5,
+        )
+        layout = carnet_sheet.compute_layout(config, 3 / 4)
+        self.assertAlmostEqual(
+            layout.content_width, carnet_sheet.mm_to_pt(175), places=3
+        )
+
+    def test_oversized_tweak_shrinks_with_fit_to_page(self) -> None:
+        # 6 x 35 mm does not fit between letter margins; the CLI/GUI
+        # "shrink to fit" path must scale it down uniformly instead of
+        # failing, and report the actual (smaller) cell size.
+        config = carnet_sheet.LayoutConfig(
+            photo_width=carnet_sheet.mm_to_pt(35),
+            photo_height=carnet_sheet.mm_to_pt(45),
+            fit_to_page=True,
+        )
+        layout = carnet_sheet.compute_layout(config, 3 / 4)
+        self.assertTrue(layout.scaled)
+        self.assertLess(layout.photo_width, carnet_sheet.mm_to_pt(35))
+
+    def test_pdf_cells_exact_when_image_aspect_differs(self) -> None:
+        # 4:3 landscape image inside the default portrait box: the drawn
+        # cells (border rectangles) must still be exactly 85.79 x 114.14 pt,
+        # with the image pillarboxed on white inside each one.
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600), color=(40, 40, 120))  # 4:3
+        out = self.tmp / "wide_sheet.pdf"
+        summary = carnet_sheet.generate_pdf(
+            wide, out, carnet_sheet.LayoutConfig()
+        )
+        self.assertEqual(summary["photo_size"], (85.79, 114.14))
+        borders = _rect_stroke_operations(_page_content(out.read_bytes()))
+        self.assertEqual(len(borders), 6)
+        for _x, _y, w, h in borders:
+            self.assertAlmostEqual(w, 85.79, places=4)
+            self.assertAlmostEqual(h, 114.14, places=4)
+
+    def test_pdf_image_content_stays_aspect_true(self) -> None:
+        # ...and the embedded content keeps the image's own aspect ratio.
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600), color=(40, 40, 120))  # 4:3
+        out = self.tmp / "wide_content.pdf"
+        carnet_sheet.generate_pdf(wide, out, carnet_sheet.LayoutConfig())
+        ops = _image_draw_operations(_page_content(out.read_bytes()))
+        for _x, _y, w, h in ops:
+            self.assertAlmostEqual(w / h, 4 / 3, places=4)  # not 85.79/114.14
+            self.assertLessEqual(w, 85.79 + 1e-6)
+            self.assertLessEqual(h, 114.14 + 1e-6)
+
+    def test_multimix_cells_share_exact_geometry(self) -> None:
+        # Mixed-aspect images on one sheet: identical cell sizes for all
+        # (verified via the border rectangles, which trace the cells).
+        square = self.tmp / "square.png"
+        make_photo(square, size=(600, 600), color=(40, 120, 40))  # 1:1
+        out = self.tmp / "mix.pdf"
+        carnet_sheet.generate_pdf(
+            [self.photo, square], out,
+            carnet_sheet.LayoutConfig(), quantities=[2, 2],
+        )
+        borders = _rect_stroke_operations(_page_content(out.read_bytes()))
+        self.assertEqual(len(borders), 4)
+        widths = {round(w, 4) for _x, _y, w, _h in borders}
+        heights = {round(h, 4) for _x, _y, _w, h in borders}
+        self.assertEqual(widths, {85.79})
+        self.assertEqual(heights, {114.14})
 
 
 class TestMultiImageCli(BaseTestCase):
@@ -657,12 +782,12 @@ class TestGeometryHelpers(BaseTestCase):
         self.assertAlmostEqual(top_row[0][0], bottom_row[0][0], places=6)
 
     def test_box_containment_preserves_image_aspect(self) -> None:
-        # A 3:4 image inside the reference box (0.7514 aspect) is contained:
-        # width shrinks slightly so the photo is never distorted.
+        # The cell is always exactly the configured box (here the reference
+        # 0.7514-aspect box); the image keeps its own aspect *inside* it.
         config = carnet_sheet.LayoutConfig()
         layout = carnet_sheet.compute_layout(config, 3 / 4)
         self.assertAlmostEqual(layout.photo_height, 114.14, places=6)
-        self.assertAlmostEqual(layout.photo_width, 114.14 * 3 / 4, places=6)
+        self.assertAlmostEqual(layout.photo_width, 85.79, places=6)
         self.assertFalse(layout.scaled)
 
     def test_matching_aspect_fills_configured_box_exactly(self) -> None:
