@@ -117,10 +117,14 @@ The exe has two built-in test hooks (no Python needed):
 - **`CarnetSheetMaker.exe --selftest PHOTO OUT_PDF`** — full export smoke
   test: builds the window, generates a real PDF through the Generate
   button, writes `SELFTEST-OK` to `OUT_PDF.selftest.log`.
-- **`CarnetSheetMaker.exe --uxcheck OUT_PDF`** — 47-point UX check of the
+- **`CarnetSheetMaker.exe --uxcheck OUT_PDF`** — 64-point UX check of the
   size-field controls: presets, arrow-key nudging (±0.5 mm, Shift ±0.1 mm),
   red invalid-field labels, comma decimals, the live fit summary, and three
-  real exports (default, overflowing tweak, invalid settings). Pops a
+  real exports (default, overflowing tweak, invalid settings) — plus the
+  Adjust… feature: the aspect-mismatch hint, the crop dialog (fill
+  reports/labels, zoom enablement), recipe write/cancel, the Adjusted ✓
+  row button, preview thumbnails, settings persistence and a real
+  fill-recipe export. Pops a
   summary dialog (`UX-CHECK-OK`) and writes per-step results to
   `OUT_PDF.uxcheck.log`. Runs against an isolated settings store, so your
   own remembered settings are untouched. An optional third argument uses
@@ -344,7 +348,7 @@ Inside its cell, the photograph is embedded at **its own aspect ratio**
 
 ## Validation
 
-Run the acceptance test suite (81 engine/CLI tests plus 71 GUI tests,
+Run the acceptance test suite (81 engine/CLI tests plus 72 GUI tests,
 stdlib `unittest` only; GUI tests skip automatically when tkinter or a
 display is unavailable):
 

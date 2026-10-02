@@ -808,15 +808,22 @@ class CarnetSheetGUI:
         self._preview_job = self.root.after(120, self.draw_preview)
 
     @staticmethod
-    def _pil_to_photoimage(im):
-        """PPM-backed tk.PhotoImage (Tk has no built-in PNG decoder)."""
+    def _pil_to_photoimage(im, master=None):
+        """PPM-backed tk.PhotoImage (Tk has no built-in PNG decoder).
+
+        ``master`` binds the image to the Tk root that will draw it. With
+        more than one Tk root alive (e.g. the uxcheck's own root beside a
+        test harness's), an image created for the default root does not
+        exist in the other interpreter and every canvas draw fails with
+        "image doesn't exist".
+        """
         import io as _io
 
         buffer = _io.BytesIO()
         im.save(buffer, format="PPM")
         buffer.seek(0)
         try:
-            return tk.PhotoImage(data=buffer.read(), format="PPM")
+            return tk.PhotoImage(master=master, data=buffer.read(), format="PPM")
         except tk.TclError:
             return None
 
@@ -846,7 +853,7 @@ class CarnetSheetGUI:
                 else:
                     im = im.convert("RGB")
                 im.thumbnail((width_px, height_px), Image.LANCZOS)
-                thumb = self._pil_to_photoimage(im)
+                thumb = self._pil_to_photoimage(im, master=self.root)
                 if thumb is None:
                     return None
         except Exception:
@@ -877,7 +884,7 @@ class CarnetSheetGUI:
 
             image = prepare_image(entry["path"], recipe, width_px / height_px)
             image.thumbnail((width_px, height_px), Image.LANCZOS)
-            thumb = self._pil_to_photoimage(image)
+            thumb = self._pil_to_photoimage(image, master=self.root)
             if thumb is None:
                 return None
         except Exception:
@@ -1577,7 +1584,7 @@ class AdjustPhotoDialog:
                 return bx, by, bw, bh  # fallback: fill the frame
             im = base.copy()
             im.thumbnail((max(1, int(bw)), max(1, int(bh))), Image.LANCZOS)
-            photo = CarnetSheetGUI._pil_to_photoimage(im)
+            photo = CarnetSheetGUI._pil_to_photoimage(im, master=self.top)
             if photo is None:
                 return bx, by, bw, bh
             cached = (photo, photo.width(), photo.height())
@@ -2104,6 +2111,101 @@ def run_uxcheck(out_pdf: str, photo: str | None = None, timeout: float = 120.0) 
               gui._settings_note)
         check("default flow: status mentions photos",
               "photos" in gui.status.get().lower(), gui.status.get())
+
+        # --- 12. Adjust… (opt-in crop) ------------------------------------ #
+        # A 4:3 photo in the 0.7514 cell: the mismatch hint must name it,
+        # the dialog must offer the fix, and the recipe must flow through
+        # persistence, the preview, and a real generation.
+        from PIL import Image as _PilImage
+
+        wide = tmp / "ux_wide.png"
+        _PilImage.new("RGB", (800, 600), (168, 96, 52)).save(wide, format="PNG")
+        gui.add_photo(wide, 3)
+        root.update()
+        gui._update_fit_summary()
+        check("mismatched photo triggers aspect hint",
+              bool(gui.var_aspect_hint.get()), gui.var_aspect_hint.get())
+        check("aspect hint names the wide photo and bars",
+              "photo 2" in gui.var_aspect_hint.get()
+              and "top/bottom" in gui.var_aspect_hint.get(),
+              gui.var_aspect_hint.get())
+
+        dialog = AdjustPhotoDialog(root, gui.photos[1], gui.build_config())
+        check("adjust dialog reports the mismatch",
+              "top/bottom" in dialog.bars.get()
+              and "white bars" in dialog.bars.get(), dialog.bars.get())
+        dialog._rotate()
+        check("dialog rotate updates the label",
+              dialog.rotate_label.cget("text") == "Rotation: 90°",
+              str(dialog.rotate_label.cget("text")))
+        for _ in range(3):
+            dialog._rotate()  # back to 0°
+        dialog.mode.set("fill")
+        dialog._on_mode()
+        check("fill mode announces an exact fill",
+              "fills the cell exactly" in dialog.bars.get(), dialog.bars.get())
+        check("zoom enabled while filling",
+              not dialog.zoom_scale.instate(["disabled"]),
+              str(dialog.zoom_scale.state()))
+        dialog.mode.set("fit")
+        dialog._on_mode()
+        check("zoom disabled while fitting",
+              dialog.zoom_scale.instate(["disabled"]),
+              str(dialog.zoom_scale.state()))
+        dialog.mode.set("fill")
+        dialog._on_mode()
+        dialog._ok()
+        check("OK writes the fill recipe",
+              gui.photos[1]["adjustment"] is not None
+              and gui.photos[1]["adjustment"].mode == "fill",
+              repr(gui.photos[1]["adjustment"]))
+        gui._rebuild_photo_rows()
+        adjust_buttons = [
+            w for w in gui.photo_list_frame.winfo_children()
+            if isinstance(w, ttk.Button)
+        ]
+        check("row button shows Adjusted ✓",
+              any(str(b.cget("text")) == "Adjusted ✓" for b in adjust_buttons),
+              str([b.cget("text") for b in adjust_buttons]))
+        gui._update_fit_summary()
+        check("fill recipe clears the aspect hint",
+              gui.var_aspect_hint.get() == "", gui.var_aspect_hint.get())
+        thumb = gui._effective_thumbnail(gui.photos[1], 75, 100)
+        check("preview thumbnail honours the recipe",
+              thumb is not None
+              and abs(thumb.width() / thumb.height() - 0.75) < 0.02,
+              "none" if thumb is None else f"{thumb.width()}x{thumb.height()}")
+
+        dialog2 = AdjustPhotoDialog(root, gui.photos[1], gui.build_config())
+        dialog2.mode.set("fit")
+        dialog2.rotation = 180
+        dialog2._cancel()
+        check("Cancel leaves the recipe alone",
+              gui.photos[1]["adjustment"].mode == "fill"
+              and gui.photos[1]["adjustment"].rotation == 0,
+              repr(gui.photos[1]["adjustment"]))
+
+        gui.save_settings()
+        saved = store.load()
+        recipe_dict = (saved.get("photos") or [{}])[1].get("adjustment")
+        check("recipe persists in the settings store",
+              isinstance(recipe_dict, dict)
+              and recipe_dict.get("mode") == "fill",
+              repr(recipe_dict))
+        check("recipe restores from the settings store",
+              Adjustment.from_dict(recipe_dict) is not None
+              and Adjustment.from_dict(recipe_dict).mode == "fill",
+              repr(recipe_dict))
+
+        dialogs["error"].clear()
+        run_to(out.with_name("ux_adjusted.pdf"))
+        check("generation with fill recipe produces PDF",
+              pdf_ok(out.with_name("ux_adjusted.pdf")),
+              f"exists={out.with_name('ux_adjusted.pdf').exists()}")
+        check("generation with fill recipe: no error dialog",
+              not dialogs["error"], str(dialogs["error"]))
+        check("generation with fill recipe: status mentions 9 photos",
+              "9 photos" in gui.status.get(), gui.status.get())
     finally:
         try:
             root.destroy()

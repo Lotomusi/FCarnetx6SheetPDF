@@ -767,6 +767,39 @@ class TestCarnetGUI(unittest.TestCase):
             filled.width() / filled.height(), 0.75, delta=0.02
         )
 
+    def test_uxcheck_end_to_end_passes(self) -> None:
+        """The exe's own --uxcheck hook runs green end to end (no dialog)."""
+        import carnet_gui
+
+        out = self.tmp / "ux.pdf"
+        log = self.tmp / "ux.uxcheck.log"
+        saved_out, saved_err = sys.stdout, sys.stderr
+        try:
+            with mock.patch.dict("os.environ", {"UXCHECK_NO_DIALOG": "1"}):
+                rc = carnet_gui.run_uxcheck(str(out), photo=str(self.photo))
+            # run_uxcheck leaves stdout pointing at its log file (windowed
+            # exes may have unusable stdio); close it so tearDown can
+            # remove the temp dir (Windows forbids unlinking open files),
+            # then restore the runner's streams.
+            if sys.stdout is not saved_out:
+                try:
+                    sys.stdout.close()
+                except OSError:
+                    pass
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+        self.assertEqual(rc, 0)
+        logged = log.read_text(encoding="utf-8")
+        self.assertIn("UX-RESULT OK", logged)
+        # The Adjust… section must be part of the passing run.
+        for step in (
+            "mismatched photo triggers aspect hint",
+            "OK writes the fill recipe",
+            "generation with fill recipe produces PDF",
+        ):
+            self.assertIn(f"PASS {step}", logged)
+        self.assertNotIn(" FAIL ", logged)
+
     # ------------------------------------------------------------------ #
     # Settings persistence                                                #
     # ------------------------------------------------------------------ #
