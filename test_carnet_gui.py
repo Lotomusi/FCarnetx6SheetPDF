@@ -556,6 +556,218 @@ class TestCarnetGUI(unittest.TestCase):
         self.assertEqual(len(rects), 1)
 
     # ------------------------------------------------------------------ #
+    # Aspect-mismatch hint                                                #
+    # ------------------------------------------------------------------ #
+
+    def test_no_hint_when_photo_matches_the_cell(self) -> None:
+        # 600×800 is exactly 3:4; the default cell is 0.7514 — hairline
+        # slivers only, below the nagging threshold.
+        self.gui.add_photo(self.photo)
+        self.assertEqual(self.gui.var_aspect_hint.get(), "")
+
+    def test_hint_reports_wider_photo_with_top_bottom_bars(self) -> None:
+        from PIL import Image
+
+        wide = self.tmp / "wide.png"
+        Image.new("RGB", (800, 600), (40, 40, 120)).save(wide)  # 4:3
+        self.gui.add_photo(wide)
+        hint = self.gui.var_aspect_hint.get()
+        self.assertIn("photo 1", hint)
+        self.assertIn("top/bottom", hint)
+        self.assertIn("mm", hint)
+
+    def test_hint_reports_taller_photo_with_left_right_bars(self) -> None:
+        from PIL import Image
+
+        tall = self.tmp / "tall.png"
+        Image.new("RGB", (600, 900), (40, 120, 40)).save(tall)  # 2:3
+        self.gui.add_photo(tall)
+        hint = self.gui.var_aspect_hint.get()
+        self.assertIn("photo 1", hint)
+        self.assertIn("left/right", hint)
+
+    def test_hint_follows_cell_size_changes(self) -> None:
+        from PIL import Image
+
+        tall = self.tmp / "tall.png"
+        Image.new("RGB", (600, 900), (40, 120, 40)).save(tall)  # 2:3
+        self.gui.add_photo(tall)
+        self.assertTrue(self.gui.var_aspect_hint.get())
+
+        # Resize the cell to 30 × 45 mm (2:3): the photo now matches.
+        self.gui.var_photo_width.set("30.0000")
+        self.gui.var_photo_height.set("45.0000")
+        self.gui._update_fit_summary()
+        self.assertEqual(self.gui.var_aspect_hint.get(), "")
+
+    def test_hint_clears_when_photos_are_removed(self) -> None:
+        from PIL import Image
+
+        wide = self.tmp / "wide.png"
+        Image.new("RGB", (800, 600), (120, 40, 40)).save(wide)
+        self.gui.add_photo(wide)
+        self.assertTrue(self.gui.var_aspect_hint.get())
+        self.gui.clear_photos()
+        self.assertEqual(self.gui.var_aspect_hint.get(), "")
+
+    def test_hint_lists_each_mismatched_photo(self) -> None:
+        from PIL import Image
+
+        wide = self.tmp / "wide.png"
+        Image.new("RGB", (800, 600), (120, 40, 40)).save(wide)  # 4:3
+        tall = self.tmp / "tall.png"
+        Image.new("RGB", (600, 900), (40, 120, 40)).save(tall)   # 2:3
+        self.gui.add_photo(self.photo)  # matches: not listed
+        self.gui.add_photo(wide)
+        self.gui.add_photo(tall)
+        hint = self.gui.var_aspect_hint.get()
+        self.assertIn("2 photos", hint)
+        self.assertIn("photo 2", hint)
+        self.assertIn("photo 3", hint)
+        self.assertNotIn("photo 1", hint)
+
+    # ------------------------------------------------------------------ #
+    # Adjust… dialog (opt-in per-photo recipe)                            #
+    # ------------------------------------------------------------------ #
+
+    def _wide_photo(self):
+        from PIL import Image
+
+        path = self.tmp / "wide.png"
+        if not path.exists():
+            Image.new("RGB", (800, 600), (90, 40, 40)).save(path)  # 4:3
+        return path
+
+    def _open_dialog(self, path):
+        import carnet_gui
+
+        self.gui.add_photo(path)
+        index = len(self.gui.photos) - 1
+        return carnet_gui.AdjustPhotoDialog(
+            self.root, self.gui.photos[index], self.gui.build_config(),
+        )
+
+    def test_adjust_dialog_ok_writes_recipe(self) -> None:
+        dialog = self._open_dialog(self._wide_photo())
+        dialog.mode.set("fill")
+        dialog.zoom.set(1.5)
+        dialog.offset_x = 0.25
+        dialog.offset_y = 0.4
+        dialog.rotation = 90
+        dialog._ok()
+        self.assertEqual(
+            self.gui.photos[0]["adjustment"],
+            carnet_sheet.Adjustment(
+                mode="fill", zoom=1.5, offset_x=0.25,
+                offset_y=0.4, rotation=90,
+            ),
+        )
+
+    def test_adjust_dialog_cancel_keeps_previous_recipe(self) -> None:
+        recipe = carnet_sheet.parse_adjustment("fill,zoom=1.4")
+        self.gui.add_photo(self._wide_photo(), 6, adjustment=recipe)
+        dialog = self._open_dialog(self._wide_photo())
+        dialog.mode.set("fit")
+        dialog.rotation = 180
+        dialog._cancel()
+        self.assertEqual(self.gui.photos[0]["adjustment"], recipe)
+
+    def test_adjust_button_reflects_recipe_state(self) -> None:
+        self.gui.add_photo(self._wide_photo())
+        self.gui._rebuild_photo_rows()
+        buttons = [
+            w for w in self.gui.photo_list_frame.winfo_children()
+            if isinstance(w, ttk.Button)
+        ]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["text"], "Adjust…")
+        self.gui.photos[0]["adjustment"] = carnet_sheet.parse_adjustment("fill")
+        self.gui._rebuild_photo_rows()
+        buttons = [
+            w for w in self.gui.photo_list_frame.winfo_children()
+            if isinstance(w, ttk.Button)
+        ]
+        self.assertEqual(buttons[0]["text"], "Adjusted ✓")
+
+    def test_fill_recipe_clears_the_mismatch_hint(self) -> None:
+        self.gui.add_photo(self._wide_photo())  # 4:3 in a 0.75 cell: hint
+        self.assertTrue(self.gui.var_aspect_hint.get())
+        # Opt-in fill: effective aspect == cell aspect -> no hint.
+        self.gui.photos[0]["adjustment"] = carnet_sheet.parse_adjustment("fill")
+        self.gui._update_fit_summary()
+        self.assertEqual(self.gui.var_aspect_hint.get(), "")
+
+    def test_rotation_swaps_the_hint_bar_sides(self) -> None:
+        # self.photo is 600×800 (3:4): matches the default cell — no hint.
+        self.gui.add_photo(self.photo)
+        self.assertEqual(self.gui.var_aspect_hint.get(), "")
+        # Turned 90° it is effectively 4:3 -> top/bottom bars.
+        self.gui.photos[0]["adjustment"] = carnet_sheet.Adjustment(rotation=90)
+        self.gui._update_fit_summary()
+        self.assertIn("top/bottom", self.gui.var_aspect_hint.get())
+
+    def test_on_generate_passes_adjustments(self) -> None:
+        import carnet_gui
+
+        self.gui.add_photo(
+            self._wide_photo(), 2,
+            adjustment=carnet_sheet.parse_adjustment("fill,zoom=1.5"),
+        )
+        self.gui.add_photo(self.photo, 3)  # no recipe: None entry
+        self.gui.output_path = self.tmp / "gen.pdf"
+        self.gui.var_output.set(str(self.gui.output_path))
+        captured: dict = {}
+
+        def fake_worker(gui_self, paths, copies, output_path, config,
+                        adjustments=None):
+            captured.update(
+                paths=paths, copies=copies, adjustments=adjustments
+            )
+
+        class SyncThread:
+            """Run the worker synchronously: no scheduling to wait for."""
+
+            def __init__(self, target=None, args=(), daemon=False):
+                self._target, self._args = target, args
+
+            def start(self):
+                self._target(*self._args)
+
+        with mock.patch.object(
+            carnet_gui.CarnetSheetGUI, "_generate_worker", fake_worker
+        ), mock.patch.object(carnet_gui.threading, "Thread", SyncThread):
+            self.gui.on_generate()
+        self.assertEqual(captured["adjustments"][0].zoom, 1.5)
+        self.assertIsNone(captured["adjustments"][1])
+        self.assertEqual(captured["copies"], [2, 3])
+
+    def test_adjustment_recipe_persists_between_instances(self) -> None:
+        import carnet_gui
+
+        recipe = carnet_sheet.parse_adjustment(
+            "fill,zoom=1.25,offset_x=0.3,rotation=90"
+        )
+        self.gui.add_photo(self._wide_photo(), 4, adjustment=recipe)
+        self.gui.save_settings()
+        gui2 = carnet_gui.CarnetSheetGUI(self.root, store=self.store)
+        self.assertEqual(len(gui2.photos), 1)
+        self.assertEqual(gui2.photos[0]["adjustment"], recipe)
+
+    def test_effective_thumbnail_honors_recipe(self) -> None:
+        self.gui.add_photo(self._wide_photo())  # 800×600 (4:3)
+        plain = self.gui._effective_thumbnail(self.gui.photos[0], 75, 100)
+        self.gui.photos[0]["adjustment"] = carnet_sheet.parse_adjustment("fill")
+        filled = self.gui._effective_thumbnail(self.gui.photos[0], 75, 100)
+        self.assertIsNotNone(plain)
+        self.assertIsNotNone(filled)
+        # Plain: the 4:3 photo contained in the frame (wide, short).
+        # Filled: cropped to the cell ratio — fills the frame's height.
+        self.assertGreater(filled.height(), plain.height())
+        self.assertAlmostEqual(
+            filled.width() / filled.height(), 0.75, delta=0.02
+        )
+
+    # ------------------------------------------------------------------ #
     # Settings persistence                                                #
     # ------------------------------------------------------------------ #
 

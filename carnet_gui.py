@@ -14,6 +14,12 @@ Extras:
 This window performs layout only — it never modifies the photographs.
 The heavy lifting (validation, layout math, PDF writing) lives in
 carnet_sheet.py and is shared with the command-line interface.
+
+The one opt-in exception is the per-photo "Adjust…" recipe: when the user
+explicitly asks for it, the photo is cropped to the cell ratio ("fill") or
+quarter-turned, in memory only, so a photo whose ratio does not match the
+cell can still fill it exactly. The default ("fit") keeps every photograph
+exactly as provided, and no file on disk is ever modified.
 """
 
 from __future__ import annotations
@@ -36,20 +42,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from carnet_sheet import (  # noqa: E402
+    Adjustment,
     LayoutConfig,
     LayoutError,
     PAPER_SIZES,
     check_output_not_input,
+    crop_to_aspect,
     default_output_path,
     generate_pdf,
     load_source_image,
     mm_to_pt,
+    oriented_image,
     placement_plan,
+    prepare_image,
     pt_to_mm,
 )
 
 APP_NAME = "Carnet Photo Sheet Maker"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # Settings shown in the GUI. Units always display in millimetres; the
 # point-based defaults are converted for display and converted back on
@@ -76,6 +86,11 @@ MM_DECIMALS = 4
 DEFAULT_COPIES = 6
 COPIES_MIN = 1
 COPIES_MAX = 99
+
+# White bars smaller than this (per side) are hairline slivers (a true 3:4
+# photo in the default 30.3 × 40.3 mm cell) and never trigger the mismatch
+# hint — only visible mismatch does.
+ASPECT_HINT_MIN_MM = 0.2
 
 # Bumped when the meaning of persisted settings changes. Version 3 is the
 # exact-cells release: "shrink to fit" is now the default, so settings saved
@@ -396,6 +411,16 @@ class CarnetSheetGUI:
             foreground="#404040", wraplength=330, justify="left",
         ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        # Aspect-mismatch hint: photos whose ratio won't fill the cell
+        # exactly are letterboxed/pillarboxed on white when printed. The
+        # hint names the photos and the white-bar size so the user can fix
+        # the source image (or accept the bars) before generating.
+        self.var_aspect_hint = tk.StringVar(value="")
+        ttk.Label(
+            box, textvariable=self.var_aspect_hint, font=("TkDefaultFont", 8),
+            foreground="#8a6d00", wraplength=330, justify="left",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
         ttk.Checkbutton(
             box, text="Draw thin borders (cutting guides)",
             variable=self.var_border,
@@ -541,17 +566,78 @@ class CarnetSheetGUI:
         if not matched and self.var_preset.get() != PRESET_CUSTOM:
             self.var_preset.set(PRESET_CUSTOM)
 
+    @staticmethod
+    def _effective_aspect(entry: dict, cell_aspect: float) -> float | None:
+        """Aspect the photo will effectively occupy on the sheet.
+
+        Adjustments matter: fill mode fills the cell exactly (never any
+        white bars) and quarter turns swap a photo's ratio.
+        """
+        aspect = entry.get("aspect")
+        if aspect is None:
+            return None
+        recipe = entry.get("adjustment")
+        if recipe is not None:
+            return recipe.effective_aspect(aspect, cell_aspect)
+        return aspect
+
+    def _aspect_hint_text(self, config: LayoutConfig) -> str:
+        """Describe photos whose aspect won't fill the cell exactly.
+
+        A photo wider than the cell is letterboxed (white bars top and
+        bottom); a taller one is pillarboxed (bars left and right). Bars
+        below ASPECT_HINT_MIN_MM are hairline slivers (a true 3:4 photo in
+        the default 30.3 × 40.3 mm cell) and are not worth nagging about.
+        """
+        cell_aspect = config.photo_width / config.photo_height
+        mismatches: list[tuple[int, float, str]] = []  # (n, mm/side, where)
+        for index, entry in enumerate(self.photos):
+            aspect = self._effective_aspect(entry, cell_aspect)
+            if aspect is None:
+                continue  # unreadable photo: already reported elsewhere
+            if aspect > cell_aspect:
+                bars_pt = (config.photo_height - config.photo_width / aspect) / 2.0
+                where = "top/bottom"
+            else:
+                bars_pt = (config.photo_width - config.photo_height * aspect) / 2.0
+                where = "left/right"
+            bars_mm = pt_to_mm(max(0.0, bars_pt))
+            if bars_mm >= ASPECT_HINT_MIN_MM:
+                mismatches.append((index + 1, bars_mm, where))
+        if not mismatches:
+            return ""
+        cell_mm = (
+            f"{pt_to_mm(config.photo_width):.1f} × "
+            f"{pt_to_mm(config.photo_height):.1f} mm"
+        )
+        listing = ", ".join(
+            f"photo {n}: ~{bars:.1f} mm {where}"
+            for n, bars, where in mismatches[:3]
+        ) + ("…" if len(mismatches) > 3 else "")
+        if len(mismatches) == 1:
+            return (
+                f"⚠ {listing} won't fill its {cell_mm} cell exactly — use "
+                "Adjust… to crop it, or accept the white bars."
+            )
+        return (
+            f"⚠ {len(mismatches)} photos won't fill their {cell_mm} cells "
+            f"exactly — {listing}. Use Adjust… to crop them."
+        )
+
     def _update_fit_summary(self) -> None:
         """Live one-liner: do the tweaked sizes fit, and what comes out."""
         try:
             config = self.build_config()
         except (LayoutError, ValueError):
             self.var_fit_summary.set("")
+            self.var_aspect_hint.set("")
             return
         jobs = self._job_quantities()
         if not jobs:
             self.var_fit_summary.set("")
+            self.var_aspect_hint.set("")
             return
+        self.var_aspect_hint.set(self._aspect_hint_text(config))
         total = sum(copies for _path, copies in jobs)
         # Cell geometry is aspect-independent, so a placeholder aspect is fine.
         aspects = [[0.75] * copies for _path, copies in jobs]
@@ -591,14 +677,26 @@ class CarnetSheetGUI:
     # Photo list management                                               #
     # ------------------------------------------------------------------ #
 
-    def add_photo(self, path: Path, copies: int | None = None) -> None:
+    def add_photo(
+        self, path: Path, copies: int | None = None,
+        adjustment: Adjustment | None = None,
+    ) -> None:
         """Append a photo to the list with its own quantity (default 6)."""
         entry = {
             "path": Path(path),
             "copies": tk.StringVar(
                 value=str(DEFAULT_COPIES if copies is None else copies)
             ),
+            # Opt-in crop recipe (None = keep the photo exactly as it is).
+            "adjustment": adjustment,
         }
+        # Orientation-aware aspect (width/height), cached once so the
+        # mismatch hint and the Adjust dialog stay cheap. None when the
+        # file cannot be read (the preview/status already reports that).
+        try:
+            entry["aspect"] = load_source_image(entry["path"]).aspect
+        except Exception:
+            entry["aspect"] = None
         # Live preview + persistence follow every quantity edit.
         entry["copies"].trace_add("write", lambda *_: self._schedule_preview())
         self.photos.append(entry)
@@ -663,10 +761,38 @@ class CarnetSheetGUI:
             ttk.Label(self.photo_list_frame, text="copies").grid(
                 row=row, column=3, sticky="w", padx=(2, 0)
             )
+            # Opt-in per-photo crop editor. The label shows at a glance
+            # whether this photo carries a non-identity recipe.
+            recipe = entry.get("adjustment")
+            adjusted = recipe is not None and not recipe.is_identity()
+            ttk.Button(
+                self.photo_list_frame,
+                text="Adjusted ✓" if adjusted else "Adjust…",
+                width=10,
+                command=lambda i=row: self._open_adjust_dialog(i),
+            ).grid(row=row, column=4, padx=(6, 0), pady=2)
 
         self.photo_list_frame.columnconfigure(1, weight=1)
         self._schedule_preview()
         self._save_settings_deferred()
+
+    def _open_adjust_dialog(self, index: int) -> None:
+        """Open the opt-in per-photo crop editor for one list row."""
+        if not 0 <= index < len(self.photos):
+            return
+        try:
+            config = self.build_config()
+        except (LayoutError, ValueError):
+            config = LayoutConfig()  # invalid fields: adjust to the defaults
+        AdjustPhotoDialog(
+            self.root, self.photos[index], config,
+            on_ok=self._on_adjustment_changed,
+        )
+
+    def _on_adjustment_changed(self) -> None:
+        """A photo's Adjust… recipe changed: refresh the row buttons, hint,
+        preview and the persisted settings."""
+        self._rebuild_photo_rows()
 
     # ------------------------------------------------------------------ #
     # Live preview                                                        #
@@ -680,6 +806,19 @@ class CarnetSheetGUI:
         if self._preview_job is not None:
             self.root.after_cancel(self._preview_job)
         self._preview_job = self.root.after(120, self.draw_preview)
+
+    @staticmethod
+    def _pil_to_photoimage(im):
+        """PPM-backed tk.PhotoImage (Tk has no built-in PNG decoder)."""
+        import io as _io
+
+        buffer = _io.BytesIO()
+        im.save(buffer, format="PPM")
+        buffer.seek(0)
+        try:
+            return tk.PhotoImage(data=buffer.read(), format="PPM")
+        except tk.TclError:
+            return None
 
     def _preview_thumbnail(self, path: Path, width_px: int, height_px: int):
         """Return a tk.PhotoImage of the photo at the given preview size.
@@ -707,19 +846,42 @@ class CarnetSheetGUI:
                 else:
                     im = im.convert("RGB")
                 im.thumbnail((width_px, height_px), Image.LANCZOS)
-                thumb = tk.PhotoImage(
-                    width=im.width, height=im.height
-                )
-                # Tk's PhotoImage has no native PNG decoder in older builds;
-                # writing through PPM keeps this dependency-free and fast.
-                import io as _io
-
-                buffer = _io.BytesIO()
-                im.save(buffer, format="PPM")
-                buffer.seek(0)
-                thumb = tk.PhotoImage(data=buffer.read(), format="PPM")
+                thumb = self._pil_to_photoimage(im)
+                if thumb is None:
+                    return None
         except Exception:
             return None  # unreadable photo: caller falls back to a plain rect
+        self._thumb_cache[key] = thumb
+        return thumb
+
+    def _effective_thumbnail(self, entry: dict, width_px: int, height_px: int):
+        """Preview thumbnail honouring the photo's opt-in Adjust… recipe.
+
+        The placement frame has the cell aspect, so a fill recipe makes the
+        thumbnail fill the frame exactly, exactly like the PDF will.
+        """
+        recipe = entry.get("adjustment")
+        if recipe is None or recipe.is_identity():
+            return self._preview_thumbnail(entry["path"], width_px, height_px)
+        key = (
+            str(entry["path"]), width_px, height_px,
+            recipe.mode, round(recipe.zoom, 3),
+            round(recipe.offset_x, 3), round(recipe.offset_y, 3),
+            recipe.rotation,
+        )
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from PIL import Image
+
+            image = prepare_image(entry["path"], recipe, width_px / height_px)
+            image.thumbnail((width_px, height_px), Image.LANCZOS)
+            thumb = self._pil_to_photoimage(image)
+            if thumb is None:
+                return None
+        except Exception:
+            return None  # unreadable: caller falls back to a plain rect
         self._thumb_cache[key] = thumb
         return thumb
 
@@ -735,6 +897,10 @@ class CarnetSheetGUI:
                 return []
             jobs.append((entry["path"], copies))
         return jobs
+
+    def _job_adjustments(self) -> list[Adjustment | None]:
+        """Opt-in Adjust… recipe per photo, aligned with the photo list."""
+        return [entry.get("adjustment") for entry in self.photos]
 
     def _preview_plan(self, config: LayoutConfig):
         """Plan pages for the current job, or (None, error) when it cannot.
@@ -837,13 +1003,13 @@ class CarnetSheetGUI:
         # Photos: real thumbnails when a readable photo is selected,
         # tinted rectangles otherwise.
         for placement in pages[0].placements:
-            path = self.photos[placement.job_index]["path"]
+            entry = self.photos[placement.job_index]
             x, y, w, h = (
                 placement.x, placement.y, placement.width, placement.height
             )
             cx0, cy0, cx1, cy1 = X(x), Y(y + h), X(x + w), Y(y)
-            thumb = self._preview_thumbnail(
-                path, max(1, round(w * scale)), max(1, round(h * scale))
+            thumb = self._effective_thumbnail(
+                entry, max(1, round(w * scale)), max(1, round(h * scale))
             )
             if thumb is not None:
                 # Center the thumbnail inside the frame rectangle.
@@ -986,7 +1152,11 @@ class CarnetSheetGUI:
         self._results = queue.Queue()
         threading.Thread(
             target=self._generate_worker,
-            args=([path for path, _ in jobs], [copies for _, copies in jobs], output, config),
+            args=(
+                [path for path, _ in jobs],
+                [copies for _, copies in jobs],
+                output, config, self._job_adjustments(),
+            ),
             daemon=True,
         ).start()
         # Poll for the result from the main thread only.
@@ -998,10 +1168,14 @@ class CarnetSheetGUI:
         copies: list[int],
         output_path: Path,
         config,
+        adjustments: list[Adjustment | None] | None = None,
     ) -> None:
         # Runs pure file/CPU work only: no Tk objects here.
         try:
-            summary = generate_pdf(paths, output_path, config, quantities=copies)
+            summary = generate_pdf(
+                paths, output_path, config, quantities=copies,
+                adjustments=adjustments,
+            )
             error = None
         except Exception as exc:  # reported to the user below
             summary = None
@@ -1132,7 +1306,10 @@ class CarnetSheetGUI:
                         copies = DEFAULT_COPIES
                     if not COPIES_MIN <= copies <= COPIES_MAX:
                         copies = DEFAULT_COPIES
-                    self.add_photo(Path(path), copies)
+                    self.add_photo(
+                        Path(path), copies,
+                        adjustment=Adjustment.from_dict(entry.get("adjustment")),
+                    )
         except Exception:
             pass  # corrupt or partially valid settings: keep defaults
         self._refresh_field_validation()
@@ -1175,10 +1352,15 @@ class CarnetSheetGUI:
                 ("right_margin", self.var_right_margin),
             ):
                 data[key] = parse_mm(var.get())
-            data["photos"] = [
-                {"path": str(entry["path"]), "copies": int(entry["copies"].get())}
-                for entry in self.photos
-            ]
+            data["photos"] = []
+            for entry in self.photos:
+                recipe = entry.get("adjustment")
+                data["photos"].append({
+                    "path": str(entry["path"]),
+                    "copies": int(entry["copies"].get()),
+                    **({"adjustment": recipe.to_dict()}
+                       if recipe is not None else {}),
+                })
         except (tk.TclError, ValueError):
             pass  # skip whatever is currently invalid
         self.store.save(data)
@@ -1236,6 +1418,334 @@ class CarnetSheetGUI:
             border=self.var_border.get(),
             fit_to_page=self._preview_fit(),
         )
+
+
+class AdjustPhotoDialog:
+    """Modal per-photo crop editor: Fit whole photo vs Fill & crop.
+
+    The canvas shows the photograph inside the exact cell frame — how one
+    placement will print:
+    - "Fit whole photo" (default): the whole photo, centred; the white
+      bars a ratio mismatch produces are visible directly.
+    - "Fill & crop": a cell-ratio window over the photo (drag to pan,
+      zoom to crop tighter); what is inside the window fills the cell.
+
+    OK writes the recipe into the photo entry (opt-in, in memory only; the
+    file on disk is never touched) and calls ``on_ok``. Cancel keeps the
+    previous recipe.
+    """
+
+    def __init__(self, parent, entry: dict, config: LayoutConfig,
+                 on_ok=None) -> None:
+        self.entry = entry
+        self.config = config
+        self.on_ok = on_ok
+        recipe = entry.get("adjustment") or Adjustment()
+        self.mode = tk.StringVar(
+            value=recipe.mode if recipe.mode in ("fit", "fill") else "fit"
+        )
+        self.zoom = tk.DoubleVar(value=min(2.0, max(1.0, recipe.zoom)))
+        self.offset_x = min(1.0, max(0.0, recipe.offset_x))
+        self.offset_y = min(1.0, max(0.0, recipe.offset_y))
+        self.rotation = recipe.rotation if recipe.rotation in (0, 90, 180, 270) else 0
+        self._base = None        # oriented, flattened full-resolution photo
+        self._rot_cache: dict[int, object] = {}   # rotation -> rotated copy
+        self._disp_cache: dict[int, tuple] = {}   # rotation -> (PhotoImage, w, h)
+        self._drag_from = None
+        try:
+            self._base = oriented_image(Path(entry["path"]))
+        except Exception:
+            pass  # unreadable: the preview explains; Cancel still works
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("Adjust photo")
+        self.top.resizable(False, False)
+        try:
+            self.top.transient(parent)
+        except tk.TclError:
+            pass
+        self._build()
+        self._redraw()
+        try:
+            self.top.grab_set()
+        except tk.TclError:
+            pass  # grab is modal nicety, not a requirement
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    # ------------------------------------------------------------------ #
+    # Widget construction                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _build(self) -> None:
+        top = self.top
+        self.canvas = tk.Canvas(
+            top, width=250, height=320, bg="#f0f0f0",
+            highlightthickness=1, highlightbackground="#b0b0b0",
+        )
+        self.canvas.grid(row=0, column=0, columnspan=2, padx=8, pady=(8, 4))
+        self.canvas.bind("<Button-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
+
+        modebox = ttk.LabelFrame(top, text="Fit mode", padding=(8, 4))
+        modebox.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=4)
+        ttk.Radiobutton(
+            modebox, text="Fit whole photo (white bars when the ratio differs)",
+            variable=self.mode, value="fit", command=self._on_mode,
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            modebox, text="Fill & crop (drag/zoom choose the crop)",
+            variable=self.mode, value="fill", command=self._on_mode,
+        ).pack(anchor="w")
+
+        zoombox = ttk.LabelFrame(top, text="Crop zoom", padding=(8, 4))
+        zoombox.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        self.zoom_scale = ttk.Scale(
+            zoombox, from_=1.0, to=2.0, variable=self.zoom,
+            command=lambda *_: self._on_zoom(),
+        )
+        self.zoom_scale.pack(fill="x")
+        self.zoom_label = ttk.Label(zoombox, text="", anchor="w")
+        self.zoom_label.pack(fill="x")
+
+        btns = ttk.Frame(top)
+        btns.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(btns, text="Rotate 90°", command=self._rotate).pack(
+            fill="x", pady=2
+        )
+        self.rotate_label = ttk.Label(btns, text="", anchor="w")
+        self.rotate_label.pack(fill="x")
+        ttk.Button(btns, text="Reset", command=self._reset).pack(fill="x", pady=2)
+
+        self.bars = tk.StringVar(value="")
+        ttk.Label(
+            top, textvariable=self.bars, wraplength=380, justify="left",
+            foreground="#404040",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(2, 4))
+
+        actions = ttk.Frame(top)
+        actions.grid(row=4, column=0, columnspan=2, sticky="e", padx=10,
+                     pady=(0, 8))
+        ttk.Button(actions, text="Cancel", command=self._cancel).pack(
+            side="right", padx=4
+        )
+        ttk.Button(actions, text="OK", command=self._ok).pack(
+            side="right", padx=4
+        )
+
+    # ------------------------------------------------------------------ #
+    # Preview geometry                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _cell_box(self) -> tuple[float, float, float, float]:
+        """The cell frame rectangle (x, y, w, h) inside the canvas."""
+        canvas_w = int(self.canvas["width"])
+        canvas_h = int(self.canvas["height"])
+        aspect = self.config.photo_width / self.config.photo_height
+        w = canvas_w - 24
+        h = w / aspect
+        if h > canvas_h - 24:
+            h = canvas_h - 24
+            w = h * aspect
+        return (
+            (canvas_w - w) / 2, (canvas_h - h) / 2, w, h,
+        )
+
+    def _rotated(self):
+        """The full-resolution photo rotated by the current quarter turns."""
+        from PIL import Image
+
+        if self._base is None:
+            return None
+        image = self._rot_cache.get(self.rotation)
+        if image is None:
+            image = self._base
+            for _ in range((self.rotation // 90) % 4):
+                # Pillow's ROTATE_270 turns the image 90° clockwise.
+                image = image.transpose(Image.Transpose.ROTATE_270)
+            self._rot_cache[self.rotation] = image
+        return image
+
+    def _photo_rect(self) -> tuple[float, float, float, float]:
+        """(x, y, w, h) of the whole rotated photo contained in the box."""
+        bx, by, bw, bh = self._cell_box()
+        cached = self._disp_cache.get(self.rotation)
+        if cached is None:
+            from PIL import Image
+
+            base = self._rotated()
+            if base is None:
+                return bx, by, bw, bh  # fallback: fill the frame
+            im = base.copy()
+            im.thumbnail((max(1, int(bw)), max(1, int(bh))), Image.LANCZOS)
+            photo = CarnetSheetGUI._pil_to_photoimage(im)
+            if photo is None:
+                return bx, by, bw, bh
+            cached = (photo, photo.width(), photo.height())
+            self._disp_cache[self.rotation] = cached
+        photo, w, h = cached
+        return bx + (bw - w) / 2, by + (bh - h) / 2, float(w), float(h)
+
+    def _window_rect(self, photo_rect) -> tuple[float, float, float, float]:
+        """The crop window (x, y, w, h) over the photo, in canvas pixels."""
+        px, py, pw, ph = photo_rect
+        aspect = self.config.photo_width / self.config.photo_height
+        ww = min(pw, ph * aspect)
+        wh = ww / aspect
+        wx = px + (pw - ww) * self.offset_x
+        wy = py + (ph - wh) * self.offset_y
+        return wx, wy, ww, wh
+
+    # ------------------------------------------------------------------ #
+    # Drawing and labels                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _redraw(self) -> None:
+        canvas = self.canvas
+        canvas.delete("all")
+        bx, by, bw, bh = self._cell_box()
+        canvas.create_rectangle(
+            bx, by, bx + bw, by + bh, fill="white", outline="#404040", width=1
+        )
+        if self._base is None:
+            canvas.create_text(
+                bx + bw / 2, by + bh / 2, text="photo cannot be displayed",
+                fill="#a03030", width=int(bw),
+            )
+        else:
+            px, py, pw, ph = self._photo_rect()
+            photo = self._disp_cache[self.rotation][0]
+            canvas.create_image(px, py, anchor="nw", image=photo)
+            if self.mode.get() == "fill":
+                wx, wy, ww, wh = self._window_rect((px, py, pw, ph))
+                # Dim everything outside the window, clipped to the photo,
+                # then trace the window itself.
+                for rect in (
+                    (px, py, wx, py + ph),
+                    (wx + ww, py, px + pw, py + ph),
+                    (wx, py, wx + ww, wy),
+                    (wx, wy + wh, wx + ww, py + ph),
+                ):
+                    canvas.create_rectangle(
+                        *rect, fill="white", stipple="gray50", outline=""
+                    )
+                canvas.create_rectangle(
+                    wx, wy, wx + ww, wy + wh, outline="#a03030",
+                    width=2, dash=(4, 3),
+                )
+        self._update_labels()
+
+    def _update_labels(self) -> None:
+        zoom = self.zoom.get()
+        self.zoom_label.config(text=f"Zoom: {zoom:.2f}×  (1.00 = whole cell)")
+        self.rotate_label.config(text=f"Rotation: {self.rotation}°")
+        if self._base is None:
+            self.bars.set("The photo cannot be displayed.")
+            return
+        if self.mode.get() == "fill":
+            self.bars.set(
+                "Fill & crop: the photo fills the cell exactly — no white "
+                "bars. Drag the preview to choose the crop."
+            )
+            return
+        aspect = self._base.width / self._base.height
+        if self.rotation in (90, 270):
+            aspect = 1.0 / aspect
+        cell_aspect = self.config.photo_width / self.config.photo_height
+        if aspect > cell_aspect:
+            bars = pt_to_mm(
+                (self.config.photo_height
+                 - self.config.photo_width / aspect) / 2.0
+            )
+            where = "top/bottom"
+        else:
+            bars = pt_to_mm(
+                (self.config.photo_width
+                 - self.config.photo_height * aspect) / 2.0
+            )
+            where = "left/right"
+        if bars < ASPECT_HINT_MIN_MM:
+            self.bars.set("Fit whole photo: matches the cell — fills it exactly.")
+        else:
+            self.bars.set(
+                f"Fit whole photo: ~{bars:.1f} mm white bars {where} "
+                "with the current cell size."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Interaction                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _on_mode(self) -> None:
+        filling = self.mode.get() == "fill"
+        self.zoom_scale.state(["!disabled"] if filling else ["disabled"])
+        self._redraw()
+
+    def _on_zoom(self) -> None:
+        self._redraw()
+
+    def _rotate(self) -> None:
+        self.rotation = (self.rotation + 90) % 360
+        self._redraw()
+
+    def _reset(self) -> None:
+        self.mode.set("fit")
+        self.zoom.set(1.0)
+        self.offset_x = 0.5
+        self.offset_y = 0.5
+        self.rotation = 0
+        self._on_mode()
+
+    def _drag_start(self, event) -> None:
+        self._drag_from = (event.x, event.y, self.offset_x, self.offset_y)
+
+    def _drag_move(self, event) -> None:
+        if self.mode.get() != "fill" or self._base is None:
+            return
+        if self._drag_from is None:
+            return
+        x0, y0, ox, oy = self._drag_from
+        px, py, pw, ph = self._photo_rect()
+        _wx, _wy, ww, wh = self._window_rect((px, py, pw, ph))
+        # Moving the pointer moves the window over the photo; offsets are
+        # fractions of the available slack.
+        if pw - ww > 0:
+            self.offset_x = min(1.0, max(0.0, ox + (event.x - x0) / (pw - ww)))
+        if ph - wh > 0:
+            self.offset_y = min(1.0, max(0.0, oy + (event.y - y0) / (ph - wh)))
+        self._redraw()
+
+    # ------------------------------------------------------------------ #
+    # Result                                                              #
+    # ------------------------------------------------------------------ #
+
+    def recipe(self) -> Adjustment:
+        """The current state as a validated, persisted-friendly recipe."""
+        recipe = Adjustment(
+            mode=self.mode.get(),
+            zoom=round(min(2.0, max(1.0, self.zoom.get())), 2),
+            offset_x=round(self.offset_x, 3),
+            offset_y=round(self.offset_y, 3),
+            rotation=self.rotation,
+        )
+        recipe.validate()
+        return recipe
+
+    def _ok(self) -> None:
+        self.entry["adjustment"] = self.recipe()
+        callback = self.on_ok
+        self._destroy()
+        if callback is not None:
+            callback()
+
+    def _cancel(self) -> None:
+        self._destroy()
+
+    def _destroy(self) -> None:
+        try:
+            self.top.grab_release()
+        except tk.TclError:
+            pass
+        self.top.destroy()
 
 
 def _enable_windows_dpi_awareness() -> None:

@@ -9,7 +9,11 @@ workflow.
 
 It performs **layout and document generation only**. It never edits the
 photographs: no cropping, stretching, rotating, beautification, background
-removal, or AI processing of any kind. Works fully offline.
+removal, or AI processing of any kind. Works fully offline. The one opt-in
+exception is the per-photo **Adjust…** recipe (v1.3): when you explicitly
+ask for it, a photo can be cropped to the cell ratio ("fill") or
+quarter-turned — in memory only, never on disk — so a photo whose ratio
+does not match the cell can still fill it exactly.
 
 Two interfaces share the same layout engine:
 
@@ -103,7 +107,7 @@ smoke-tests that it launches, and uploads it as a downloadable artifact.
 
 A binary built with Windows Python 3.12 + PyInstaller is included as
 `CarnetSheetMaker.exe` (≈20 MB, single file, windowed, with icon and
-version metadata). Its version resource reads 1.2.0.0. Rebuild any time
+version metadata). Its version resource reads 1.3.0.0. Rebuild any time
 with either option above to pick up code changes.
 
 #### Verifying the exe on a Windows machine
@@ -160,6 +164,18 @@ python carnet_gui.py      # Windows
    0.5 mm (**Shift** for 0.1 mm); and a live line under the fields shows
    whether the tweak fits the page, the resulting photo size, and the
    page count before you commit to generating.
+
+   An amber line under that summary warns when a photo's ratio will not
+   fill the cell exactly (a photo that is not truly 3:4, or after a size
+   tweak), naming the white bars it would print with. Fix it with the
+   per-row **Adjust…** button: *Fit whole photo* (default — the photo is
+   used exactly as provided, white bars and all) or *Fill & crop*, which
+   crops the photo to the cell ratio so it fills it exactly — you drag the
+   preview to choose the crop window, zoom to crop tighter, and can
+   quarter-turn sideways photos (90° steps). The recipe is applied in
+   memory only (the file on disk is never touched), remembered per photo,
+   and shown in the main preview, so what you see is what prints. Rows
+   carrying a recipe show **Adjusted ✓**.
 3. Click **Generate PDF**. Missing photos and unreadable files appear as
    dialogs, never as a broken PDF. Size tweaks that do not fit the page
    are shrunk to fit automatically (the status line tells you the final
@@ -277,6 +293,7 @@ Run `python3 carnet_sheet.py --help` for the full list.
 | `--left-margin` / `--right-margin` | `30` pt | Side margins |
 | `--no-border` | borders on | Omit the thin rectangles around each photo |
 | `--fit-to-page` | off | Shrink (never stretch) to fit the page instead of erroring |
+| `--adjust` | off | Opt-in per-photo crop applied in memory (files untouched), to every input image: `fill` (crop to the cell ratio, photo fills the cell exactly) or `fit` (default, whole photo). Extra keys: `zoom=N` (≥1), `offset_x=N`, `offset_y=N` (0–1, 0.5 centres), `rotation=N` (0/90/180/270). Example: `--adjust fill,zoom=1.2,offset_y=0.4` |
 | `--mm` | off | Interpret provided sizes/margins in millimetres |
 
 Points are the PDF-native unit: 72 pt = 1 inch, so 85.79 × 114.14 pt ≈
@@ -309,6 +326,10 @@ Inside its cell, the photograph is embedded at **its own aspect ratio**
 - If not (e.g. a square photo in a portrait cell), the photo is
   letterboxed/pillarboxed on white — centred, never stretched, squashed
   or cropped.
+- The opt-in fix for unwanted bars is the per-photo **Adjust…** recipe:
+  *Fill & crop* trims the photo (in memory, never on disk) to the cell
+  ratio — chosen visually in the dialog, or `--adjust fill` on the CLI —
+  so the cell is filled exactly without ever stretching the photo.
 - The whole arrangement fits the page: by default the GUI shrinks it
   uniformly when the tweaked sizes do not fit (and says so in the status
   line). The CLI errors instead unless `--fit-to-page` is passed.
@@ -323,7 +344,7 @@ Inside its cell, the photograph is embedded at **its own aspect ratio**
 
 ## Validation
 
-Run the acceptance test suite (59 engine/CLI tests plus 57 GUI tests,
+Run the acceptance test suite (81 engine/CLI tests plus 71 GUI tests,
 stdlib `unittest` only; GUI tests skip automatically when tkinter or a
 display is unavailable):
 

@@ -526,6 +526,215 @@ def load_source_image(path: Path) -> SourceImage:
 
 
 # --------------------------------------------------------------------------- #
+# Per-photo adjustments (opt-in)                                              #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Adjustment:
+    """Opt-in, deterministic crop recipe for one photograph.
+
+    Nothing happens unless the user asks: with no Adjustment (or the
+    identity recipe below) the photograph is embedded exactly as before —
+    whole, centred on its cell, aspect-true, letterboxed/pillarboxed on
+    white when its ratio differs from the cell.
+
+    mode="fit": keep the whole photograph (white bars when the ratio
+    differs). mode="fill": crop a window with the cell's exact aspect
+    ratio so the photo fills the cell; zoom (>= 1.0) crops tighter and
+    offset_x/offset_y (0.0-1.0) slide the window horizontally/vertically
+    (0.5 centres it). rotation: quarter turns clockwise (0/90/180/270),
+    applied before the crop, for sideways photographs.
+
+    A recipe only *describes* the operation: pixels are produced in memory
+    at generation time and the original file is never modified.
+    """
+
+    mode: str = "fit"          # "fit" | "fill"
+    zoom: float = 1.0
+    offset_x: float = 0.5
+    offset_y: float = 0.5
+    rotation: int = 0
+
+    def is_identity(self) -> bool:
+        """True when the recipe changes nothing (whole photo, no rotation)."""
+        return self.mode == "fit" and self.rotation == 0
+
+    def validate(self) -> None:
+        if self.mode not in ("fit", "fill"):
+            raise LayoutError(
+                f"Unknown adjust mode {self.mode!r}. Use 'fit' or 'fill'."
+            )
+        if not 1.0 <= self.zoom <= 10.0:
+            raise LayoutError(
+                f"Adjust zoom must be between 1.0 and 10.0 (got {self.zoom:g})."
+            )
+        if not 0.0 <= self.offset_x <= 1.0 or not 0.0 <= self.offset_y <= 1.0:
+            raise LayoutError("Adjust offsets must be between 0.0 and 1.0.")
+        if self.rotation not in (0, 90, 180, 270):
+            raise LayoutError(
+                f"Adjust rotation must be 0, 90, 180 or 270 "
+                f"(got {self.rotation})."
+            )
+
+    def effective_aspect(self, raw_aspect: float, cell_aspect: float) -> float:
+        """Aspect (width/height) this photo effectively occupies.
+
+        Fill mode fills the cell exactly; fit mode keeps the photo's own
+        ratio, which quarter turns swap.
+        """
+        if self.mode == "fill":
+            return cell_aspect
+        if self.rotation in (90, 270):
+            return 1.0 / raw_aspect
+        return raw_aspect
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "zoom": self.zoom,
+            "offset_x": self.offset_x,
+            "offset_y": self.offset_y,
+            "rotation": self.rotation,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "Adjustment | None":
+        """Tolerant restore from persisted settings; None on anything odd."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            recipe = cls(
+                mode=str(data.get("mode", "fit")),
+                zoom=float(data.get("zoom", 1.0)),
+                offset_x=float(data.get("offset_x", 0.5)),
+                offset_y=float(data.get("offset_y", 0.5)),
+                rotation=int(data.get("rotation", 0)),
+            )
+            recipe.validate()
+        except (TypeError, ValueError, LayoutError):
+            return None
+        return recipe
+
+
+def parse_adjustment(spec: str) -> Adjustment:
+    """Parse an --adjust spec such as "fill" or "fill,zoom=1.3,rotation=90"."""
+    fields: dict[str, object] = {}
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        if "=" in part:
+            key, _, value = part.partition("=")
+            key, value = key.strip(), value.strip()
+            try:
+                fields[key] = int(value) if key == "rotation" else float(value)
+            except ValueError:
+                raise LayoutError(
+                    f"Could not read {key}={value!r} in --adjust {spec!r}."
+                ) from None
+        else:
+            fields["mode"] = part
+    try:
+        recipe = Adjustment(**fields)
+    except TypeError as exc:
+        raise LayoutError(
+            f"Unknown key in --adjust {spec!r} ({exc}). Valid keys: "
+            "mode, zoom, offset_x, offset_y, rotation."
+        ) from None
+    recipe.validate()
+    return recipe
+
+
+def oriented_image(path: Path) -> Image.Image:
+    """Open a photograph oriented and flattened, never touching the file.
+
+    Returns an RGB image with EXIF orientation applied (in memory) and any
+    transparency flattened onto white — the same pixels the PDF and the
+    previews work with.
+    """
+    with Image.open(path) as im:
+        im.load()
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):
+            if im.mode != "RGBA":
+                im = im.convert("RGBA")
+            background = Image.new("RGB", im.size, (255, 255, 255))
+            background.paste(im, mask=im.split()[-1])
+            return background
+        if im.mode != "RGB":
+            return im.convert("RGB")
+        return im.copy()
+
+
+def crop_to_aspect(
+    image: Image.Image,
+    target_aspect: float,
+    zoom: float = 1.0,
+    offset_x: float = 0.5,
+    offset_y: float = 0.5,
+) -> Image.Image:
+    """Crop an aspect-true window out of ``image``.
+
+    The window has exactly ``target_aspect`` (width/height). At zoom 1.0 it
+    is the largest such window; zoom > 1 crops tighter. The offsets
+    (0.0-1.0, defensively clamped) slide the window across the available
+    slack; 0.5 centres it. Deterministic: same inputs, same pixels.
+    """
+    if not target_aspect > 0:
+        raise LayoutError("Fill mode needs a positive cell aspect.")
+    if not 1.0 <= zoom <= 10.0:
+        raise LayoutError("Adjust zoom must be between 1.0 and 10.0.")
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        raise LayoutError("The photograph has no readable pixels.")
+    if w / h > target_aspect:
+        window_w, window_h = h * target_aspect, float(h)
+    else:
+        window_w, window_h = float(w), w / target_aspect
+    window_w /= zoom
+    window_h /= zoom
+    # Keep the window inside the photo and >= 1 px, then restore the exact
+    # aspect within a pixel (the clamps can nudge it).
+    win_w = max(1, min(int(round(window_w)), w))
+    win_h = max(1, min(int(round(window_h)), h))
+    if win_w / win_h > target_aspect:
+        win_w = max(1, int(round(win_h * target_aspect)))
+    else:
+        win_h = max(1, int(round(win_w / target_aspect)))
+    win_w = min(win_w, w)
+    win_h = min(win_h, h)
+    x0 = round((w - win_w) * min(1.0, max(0.0, offset_x)))
+    y0 = round((h - win_h) * min(1.0, max(0.0, offset_y)))
+    return image.crop((x0, y0, x0 + win_w, y0 + win_h))
+
+
+def prepare_image(
+    path: Path,
+    adjustment: Adjustment,
+    target_aspect: float | None = None,
+) -> Image.Image:
+    """Apply an Adjustment recipe to a photograph, in memory only.
+
+    The file on disk is never modified. mode="fit" returns the whole
+    (oriented, flattened, rotated) photograph; mode="fill" additionally
+    crops a window with ``target_aspect`` (the cell's width/height).
+    """
+    adjustment.validate()
+    if adjustment.mode == "fill" and not target_aspect:
+        raise LayoutError("Fill mode needs a positive cell aspect.")
+    im = oriented_image(path)
+    for _ in range((adjustment.rotation // 90) % 4):
+        # Pillow's ROTATE_270 turns the image 90° clockwise.
+        im = im.transpose(Image.Transpose.ROTATE_270)
+    if adjustment.mode == "fill":
+        return crop_to_aspect(
+            im, target_aspect, adjustment.zoom,
+            adjustment.offset_x, adjustment.offset_y,
+        )
+    return im
+
+
+# --------------------------------------------------------------------------- #
 # PDF generation                                                              #
 # --------------------------------------------------------------------------- #
 
@@ -535,6 +744,7 @@ def generate_pdf(
     output_path: Path,
     config: LayoutConfig,
     quantities: Sequence[int] | None = None,
+    adjustments: Sequence[Adjustment | None] | None = None,
 ) -> dict:
     """Generate the sheet PDF. Returns a summary dict describing the output.
 
@@ -551,6 +761,12 @@ def generate_pdf(
     ``quantities`` list (same length). The requested placements are packed
     sequentially (row-major): all copies of the first image, then the next,
     continuing onto extra pages with the same layout rules when needed.
+
+    ``adjustments`` (optional, opt-in): one entry per source image, each
+    either None (photograph embedded exactly as before) or an Adjustment
+    recipe. "fill" crops the photo (in memory; the file is untouched) to
+    the cell's exact aspect so it fills its cell; "fit" keeps the whole
+    photo. Identity recipes behave exactly like None.
     """
     from reportlab.lib.colors import black
     from reportlab.lib.utils import ImageReader
@@ -572,6 +788,16 @@ def generate_pdf(
             )
         if any(q < 1 for q in quantities):
             raise LayoutError("Each source image needs at least 1 copy.")
+    if adjustments is not None:
+        adjustments = list(adjustments)
+        if len(adjustments) != len(paths):
+            raise ValueError(
+                "adjustments must have one entry per source image "
+                f"({len(paths)} images, {len(adjustments)} recipes)."
+            )
+        for recipe in adjustments:
+            if recipe is not None:
+                recipe.validate()
 
     output_path = Path(output_path)
 
@@ -600,10 +826,24 @@ def generate_pdf(
 
     first_page = pages[0].result
 
+    # The cell aspect after any fit-to-page scaling (uniform, so the ratio
+    # matches the configured one) — the crop target for fill adjustments.
+    cell_aspect = first_page.photo_width / first_page.photo_height
+
     # --- Embed buffers (EXIF-oriented pixels where needed) -------------------
     embeds: dict[int, io.BytesIO] = {}
     for index, source in enumerate(sources):
-        if source.exif_applied:
+        recipe = adjustments[index] if adjustments else None
+        if recipe is not None and not recipe.is_identity():
+            # Opt-in adjustment: prepared pixels (EXIF-oriented, flattened,
+            # rotated, optionally cropped to the cell aspect) — the original
+            # file on disk is never touched.
+            prepared = prepare_image(paths[index], recipe, cell_aspect)
+            buffer = io.BytesIO()
+            prepared.save(buffer, format="PNG")
+            buffer.seek(0)
+            embeds[index] = buffer
+        elif source.exif_applied:
             with Image.open(paths[index]) as im:
                 im.load()
                 buffer = io.BytesIO()
@@ -744,6 +984,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fit-to-page", action="store_true",
                    help="shrink photos (aspect ratio preserved) to fit the page "
                         "instead of failing when the layout does not fit")
+    p.add_argument("--adjust", metavar="SPEC", default=None,
+                   help="opt-in per-photo crop applied in memory (files are "
+                        "never modified), applied to every input image: "
+                        "'fill' crops to the cell ratio so the photo fills "
+                        "the cell exactly; 'fit' (default) keeps the whole "
+                        "photo. Optional keys: zoom=N (>=1, default 1.0), "
+                        "offset_x=N, offset_y=N (0..1, 0.5 centres), "
+                        "rotation=N (0/90/180/270). Example: --adjust "
+                        "fill,zoom=1.2,offset_y=0.4")
     p.add_argument("--mm", action="store_true",
                    help="interpret sizes and margins in millimetres instead of points")
     return p
@@ -840,7 +1089,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        summary = generate_pdf(image_paths, output_path, config, quantities)
+        adjustment = parse_adjustment(args.adjust) if args.adjust else None
+        summary = generate_pdf(
+            image_paths, output_path, config, quantities,
+            adjustments=[adjustment] * len(image_paths) if adjustment else None,
+        )
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

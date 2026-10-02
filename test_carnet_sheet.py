@@ -800,5 +800,286 @@ class TestGeometryHelpers(BaseTestCase):
         self.assertFalse(layout.scaled)
 
 
+class TestAdjustments(BaseTestCase):
+    """Opt-in per-photo crop recipes (Adjustment / prepare_image / CLI)."""
+
+    CELL_ASPECT = 85.79 / 114.14  # the default photo box
+
+    def make_gradient(self, size: tuple[int, int] = (100, 80)) -> Image.Image:
+        """Image whose pixel (x, y) is (2x, 2y, 0) — crop position visible."""
+        im = Image.new("RGB", size)
+        px = im.load()
+        for x in range(size[0]):
+            for y in range(size[1]):
+                px[x, y] = (x * 2, y * 2, 0)
+        return im
+
+    # ---------------- recipe parsing / validation ---------------------- #
+
+    def test_parse_adjustment_specs(self) -> None:
+        self.assertEqual(carnet_sheet.parse_adjustment("fill"),
+                         carnet_sheet.Adjustment(mode="fill"))
+        self.assertEqual(
+            carnet_sheet.parse_adjustment("fill,zoom=1.3,offset_x=0.2,rotation=90"),
+            carnet_sheet.Adjustment(mode="fill", zoom=1.3,
+                                    offset_x=0.2, rotation=90),
+        )
+        self.assertEqual(
+            carnet_sheet.parse_adjustment(" fit , zoom = 2 "),
+            carnet_sheet.Adjustment(mode="fit", zoom=2.0),
+        )
+
+    def test_parse_adjustment_rejects_garbage(self) -> None:
+        for bad in ("bogus", "fill,zoom=abc", "fill,unknown=1",
+                    "fill,zoom=0.5", "fill,offset_x=2", "fill,rotation=45"):
+            with self.assertRaises(carnet_sheet.LayoutError, msg=bad):
+                carnet_sheet.parse_adjustment(bad)
+
+    def test_identity_recipe_and_effective_aspect(self) -> None:
+        self.assertTrue(carnet_sheet.Adjustment().is_identity())
+        self.assertTrue(
+            carnet_sheet.Adjustment(mode="fit", zoom=3.0).is_identity()
+        )  # zoom/offset are irrelevant when the whole photo is kept
+        self.assertFalse(carnet_sheet.Adjustment(mode="fill").is_identity())
+        self.assertFalse(
+            carnet_sheet.Adjustment(mode="fit", rotation=90).is_identity()
+        )
+        self.assertAlmostEqual(
+            carnet_sheet.Adjustment(mode="fill")
+            .effective_aspect(4 / 3, self.CELL_ASPECT),
+            self.CELL_ASPECT,
+        )
+        self.assertAlmostEqual(
+            carnet_sheet.Adjustment(mode="fit", rotation=90)
+            .effective_aspect(3 / 4, self.CELL_ASPECT),
+            4 / 3,
+        )
+        self.assertAlmostEqual(
+            carnet_sheet.Adjustment(mode="fit", rotation=180)
+            .effective_aspect(3 / 4, self.CELL_ASPECT),
+            3 / 4,
+        )
+
+    def test_adjustment_from_dict_is_tolerant(self) -> None:
+        recipe = carnet_sheet.Adjustment(mode="fill", zoom=1.5, rotation=90)
+        self.assertEqual(
+            carnet_sheet.Adjustment.from_dict(recipe.to_dict()), recipe
+        )
+        self.assertIsNone(carnet_sheet.Adjustment.from_dict("nonsense"))
+        self.assertIsNone(carnet_sheet.Adjustment.from_dict(None))
+        self.assertIsNone(carnet_sheet.Adjustment.from_dict(
+            {"mode": "fill", "zoom": "x"}))
+        self.assertIsNone(carnet_sheet.Adjustment.from_dict(
+            {"mode": "bogus"}))
+
+    def test_adjustment_validate_errors(self) -> None:
+        for bad in (
+            carnet_sheet.Adjustment(mode="bogus"),
+            carnet_sheet.Adjustment(zoom=0.5),
+            carnet_sheet.Adjustment(zoom=11.0),
+            carnet_sheet.Adjustment(offset_x=-0.1),
+            carnet_sheet.Adjustment(offset_y=1.5),
+            carnet_sheet.Adjustment(rotation=45),
+        ):
+            with self.assertRaises(carnet_sheet.LayoutError):
+                bad.validate()
+
+    # ---------------- crop_to_aspect window math ----------------------- #
+
+    def test_crop_window_is_largest_aspect_true_fit(self) -> None:
+        out = carnet_sheet.crop_to_aspect(self.make_gradient(), 0.75)
+        self.assertEqual(out.size, (60, 80))          # 100×80 → 60×80
+
+    def test_crop_window_zoom_shrinks_uniformly(self) -> None:
+        out = carnet_sheet.crop_to_aspect(self.make_gradient(), 0.75, zoom=2.0)
+        self.assertEqual(out.size, (30, 40))          # exactly half
+
+    def test_crop_window_offsets_slide_and_clamp(self) -> None:
+        g = self.make_gradient()
+        # zoom 1: vertical slack is zero, offset_x 1.0 → x0 = 40
+        right = carnet_sheet.crop_to_aspect(g, 0.75, 1.0, 1.0, 1.0)
+        self.assertEqual(right.size, (60, 80))
+        self.assertEqual(right.getpixel((0, 0)), (80, 0, 0))
+        left = carnet_sheet.crop_to_aspect(g, 0.75, 1.0, 0.0, 0.0)
+        self.assertEqual(left.getpixel((0, 0)), (0, 0, 0))
+        # zoom 2: window 30×40, slacks 70/40
+        corner = carnet_sheet.crop_to_aspect(g, 0.75, 2.0, 1.0, 1.0)
+        self.assertEqual(corner.getpixel((0, 0)), (140, 80, 0))
+        centre = carnet_sheet.crop_to_aspect(g, 0.75, 2.0, 0.5, 0.5)
+        self.assertEqual(centre.getpixel((0, 0)), (70, 40, 0))
+
+    def test_crop_matches_return_the_image_unchanged(self) -> None:
+        g = self.make_gradient((75, 100))
+        out = carnet_sheet.crop_to_aspect(g, 0.75)
+        self.assertEqual(out.size, g.size)
+        self.assertEqual(list(out.getdata()), list(g.getdata()))
+
+    # ---------------- prepare_image (file in, pixels out) --------------- #
+
+    def test_prepare_fill_crops_to_target_aspect(self) -> None:
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600))                      # 4:3
+        out = carnet_sheet.prepare_image(
+            wide, carnet_sheet.parse_adjustment("fill"), self.CELL_ASPECT)
+        self.assertAlmostEqual(out.width / out.height, self.CELL_ASPECT,
+                               delta=0.01)
+        zoomed = carnet_sheet.prepare_image(
+            wide, carnet_sheet.parse_adjustment("fill,zoom=2"), self.CELL_ASPECT)
+        self.assertAlmostEqual(zoomed.width / out.width, 0.5, delta=0.01)
+
+    def test_prepare_fit_rotation_is_lossless_quarter_turns(self) -> None:
+        quad = self.tmp / "quad.png"
+        im = Image.new("RGB", (2, 2))
+        im.putdata(
+            [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)]
+        )
+        im.save(quad)
+        rot90 = carnet_sheet.prepare_image(
+            quad, carnet_sheet.parse_adjustment("fit,rotation=90"))
+        self.assertEqual(rot90.size, (2, 2))  # square: only pixels move
+        self.assertEqual(
+            list(rot90.getdata()),
+            [(3, 3, 3), (1, 1, 1), (4, 4, 4), (2, 2, 2)],
+        )
+        tall = self.tmp / "tall.png"
+        make_photo(tall, size=(600, 800))
+        turned = carnet_sheet.prepare_image(
+            tall, carnet_sheet.parse_adjustment("fit,rotation=90"))
+        self.assertEqual(turned.size, (800, 600))
+        turned2 = carnet_sheet.prepare_image(
+            tall, carnet_sheet.parse_adjustment("fit,rotation=270"))
+        self.assertEqual(turned2.size, (800, 600))
+        full = carnet_sheet.prepare_image(
+            tall, carnet_sheet.parse_adjustment("fit"))
+        self.assertEqual(full.size, (600, 800))
+
+    def test_prepare_flattens_transparency_on_white(self) -> None:
+        rgba = self.tmp / "rgba.png"
+        im = Image.new("RGBA", (10, 10), (255, 0, 0, 0))     # transparent
+        im.save(rgba)
+        out = carnet_sheet.prepare_image(rgba, carnet_sheet.Adjustment())
+        self.assertEqual(out.mode, "RGB")
+        self.assertEqual(out.getpixel((5, 5)), (255, 255, 255))
+
+    def test_prepare_never_modifies_the_original_file(self) -> None:
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600))
+        before = hashlib.sha256(wide.read_bytes()).hexdigest()
+        carnet_sheet.prepare_image(
+            wide, carnet_sheet.parse_adjustment("fill,zoom=1.4,offset_x=0.2"),
+            self.CELL_ASPECT)
+        after = hashlib.sha256(wide.read_bytes()).hexdigest()
+        self.assertEqual(before, after)
+
+    def test_fill_without_target_aspect_is_an_error(self) -> None:
+        with self.assertRaises(carnet_sheet.LayoutError):
+            carnet_sheet.prepare_image(
+                self.photo, carnet_sheet.parse_adjustment("fill"))
+
+    # ---------------- generate_pdf integration ------------------------- #
+
+    def embedded_sizes(self, pdf: Path) -> list[tuple[int, int]]:
+        return [(img["width"], img["height"])
+                for img in _xobject_images(pdf.read_bytes())]
+
+    def test_fill_recipe_embeds_cell_aspect_pixels(self) -> None:
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600))                      # 4:3
+        out = self.tmp / "filled.pdf"
+        carnet_sheet.generate_pdf(
+            wide, out, carnet_sheet.LayoutConfig(),
+            adjustments=[carnet_sheet.parse_adjustment("fill")])
+        data = out.read_bytes()
+        sizes = self.embedded_sizes(out)
+        self.assertEqual(len(sizes), 1)
+        self.assertAlmostEqual(sizes[0][0] / sizes[0][1], self.CELL_ASPECT,
+                               delta=0.01)
+        # six placements of that one image, cells still exactly sized
+        self.assertEqual(len(_image_draw_operations(_page_content(data))), 6)
+
+    def test_identity_recipe_matches_no_adjustment_output(self) -> None:
+        plain = self.tmp / "plain.pdf"
+        ident = self.tmp / "ident.pdf"
+        carnet_sheet.generate_pdf(self.photo, plain, carnet_sheet.LayoutConfig())
+        carnet_sheet.generate_pdf(
+            self.photo, ident, carnet_sheet.LayoutConfig(),
+            adjustments=[carnet_sheet.Adjustment()])
+        self.assertEqual(self.embedded_sizes(plain), self.embedded_sizes(ident))
+        self.assertEqual(
+            _image_draw_operations(_page_content(plain.read_bytes())),
+            _image_draw_operations(_page_content(ident.read_bytes())),
+        )
+
+    def test_fit_rotation_embeds_rotated_pixels(self) -> None:
+        tall = self.tmp / "tall.png"
+        make_photo(tall, size=(600, 800))
+        out = self.tmp / "turned.pdf"
+        carnet_sheet.generate_pdf(
+            tall, out, carnet_sheet.LayoutConfig(),
+            adjustments=[carnet_sheet.parse_adjustment("fit,rotation=90")])
+        self.assertEqual(self.embedded_sizes(out), [(800, 600)])
+
+    def test_multi_image_adjustments_apply_per_photo(self) -> None:
+        tall = self.tmp / "tall.png"
+        wide = self.tmp / "wide.png"
+        make_photo(tall, size=(600, 800))                      # 3:4
+        make_photo(wide, size=(800, 600))                       # 4:3
+        out = self.tmp / "mixed.pdf"
+        carnet_sheet.generate_pdf(
+            [tall, wide], out, carnet_sheet.LayoutConfig(),
+            quantities=[3, 3],
+            adjustments=[
+                None,
+                carnet_sheet.parse_adjustment("fill,zoom=2,offset_x=0.25"),
+            ])
+        sizes = set(self.embedded_sizes(out))
+        self.assertEqual(len(self.embedded_sizes(out)), 2)     # two objects
+        self.assertIn((600, 800), sizes)                       # untouched
+        for w, h in sizes:
+            if (w, h) != (600, 800):
+                self.assertAlmostEqual(w / h, self.CELL_ASPECT, delta=0.01)
+
+    def test_adjustment_count_mismatch_is_an_error(self) -> None:
+        out = self.tmp / "bad.pdf"
+        with self.assertRaises(ValueError):
+            carnet_sheet.generate_pdf(
+                self.photo, out, carnet_sheet.LayoutConfig(),
+                adjustments=[])
+        with self.assertRaises(carnet_sheet.LayoutError):
+            carnet_sheet.generate_pdf(
+                self.photo, out, carnet_sheet.LayoutConfig(),
+                adjustments=[carnet_sheet.Adjustment(mode="bogus")])
+
+    # ---------------- CLI --adjust -------------------------------------- #
+
+    def test_cli_adjust_fill_crops_to_cell(self) -> None:
+        wide = self.tmp / "wide.png"
+        make_photo(wide, size=(800, 600))
+        out = self.tmp / "cli_fill.pdf"
+        rc = carnet_sheet.main(
+            [str(wide), "-o", str(out), "--adjust", "fill"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.exists())
+        for w, h in self.embedded_sizes(out):
+            self.assertAlmostEqual(w / h, self.CELL_ASPECT, delta=0.01)
+
+    def test_cli_adjust_fit_rotation_turns_photo(self) -> None:
+        out = self.tmp / "cli_rot.pdf"
+        rc = carnet_sheet.main(
+            [str(self.photo), "-o", str(out), "--adjust", "fit,rotation=90"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.embedded_sizes(out), [(800, 600)])
+
+    def test_cli_adjust_bogus_spec_is_actionable_error(self) -> None:
+        for spec in ("bogus", "fill,zoom=abc", "fill,rotation=45"):
+            with contextlib.redirect_stderr(io.StringIO()) as captured:
+                rc = carnet_sheet.main(
+                    [str(self.photo), "-o",
+                     str(self.tmp / f"bad_{hash(spec) % 9973}.pdf"),
+                     "--adjust", spec])
+            self.assertEqual(rc, 2, spec)
+            self.assertIn("Error", captured.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
